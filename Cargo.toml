@@ -1,0 +1,33 @@
+[package]
+name = "mems3-grpc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "In-memory S3-like object store served over gRPC with pluggable auth/storage abstractions."
+build = "build.rs"
+
+[dependencies]
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "signal", "fs"] }
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+prost-types = "0.13"
+bytes = "1.7"
+async-trait = "0.1"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+md5 = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3.0"
+tonic-build = "0.12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3.12"

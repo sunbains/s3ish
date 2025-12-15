@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package mems3.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message BucketName { string name = 1; }
+
+message ObjectKey {
+  string bucket = 1;
+  string key = 2;
+}
+
+message PutObjectRequest {
+  ObjectKey object = 1;
+  bytes data = 2;
+  string content_type = 3;
+}
+
+message PutObjectResponse {
+  string etag = 1;
+  uint64 size = 2;
+  google.protobuf.Timestamp last_modified = 3;
+}
+
+message GetObjectRequest { ObjectKey object = 1; }
+
+message GetObjectResponse {
+  bytes data = 1;
+  string content_type = 2;
+  string etag = 3;
+  google.protobuf.Timestamp last_modified = 4;
+}
+
+message DeleteObjectRequest { ObjectKey object = 1; }
+message DeleteObjectResponse { bool deleted = 1; }
+
+message CreateBucketRequest { BucketName bucket = 1; }
+message CreateBucketResponse { bool created = 1; }
+
+message DeleteBucketRequest { BucketName bucket = 1; }
+message DeleteBucketResponse { bool deleted = 1; }
+
+message ListObjectsRequest {
+  string bucket = 1;
+  string prefix = 2;
+  uint32 limit = 3; // 0 = default
+}
+
+message ObjectInfo {
+  string key = 1;
+  uint64 size = 2;
+  string etag = 3;
+  string content_type = 4;
+  google.protobuf.Timestamp last_modified = 5;
+}
+
+message ListObjectsResponse {
+  repeated ObjectInfo objects = 1;
+}
+
+service ObjectStore {
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+
+  rpc PutObject(PutObjectRequest) returns (PutObjectResponse);
+  rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+}

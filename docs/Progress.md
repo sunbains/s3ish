@@ -61,3 +61,10 @@
   - Updated README.md with fuzz testing quick start
   - All fuzz targets compile and run successfully
   - Tests/Lints: `cargo fuzz build`, `cargo fuzz run <target>`
+- 2025-12-16: Reorganized documentation structure:
+  - Created docs/ directory and moved all .md files (except README.md) into it
+  - Moved 10 documentation files: API_USAGE.md, ARCHITECTURE.md, FUZZING.md, OBSERVABILITY.md, QUICK_START_S3.md, S3_COMPATIBILITY_ROADMAP.md, STORAGE_ENGINE_PLAN.md, Progress.md, Storage-proposed-architecture.md, USAGE.md
+  - Updated all documentation links in README.md to point to docs/ directory
+  - Added comprehensive Documentation section to README.md listing all available docs with descriptions
+  - Verified all cross-references and relative links within documentation files work correctly
+  - All 132 tests still passing after reorganization

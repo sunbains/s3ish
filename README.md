@@ -113,7 +113,7 @@ Once you decide that the Raft log is the source of truth, everything else become
 
 The current implementation provides the S3-compatible foundation layer with pluggable storage backends. The log-authoritative ARIES-based storage engine is planned for future implementation.
 
-**See [STORAGE_ENGINE_PLAN.md](STORAGE_ENGINE_PLAN.md) for the detailed implementation plan.**
+**See [STORAGE_ENGINE_PLAN.md](docs/STORAGE_ENGINE_PLAN.md) for the detailed implementation plan.**
 
 Key points about the planned architecture:
 - **External orchestrator**: Consensus/Raft layer is handled externally and provides ordered log entries
@@ -138,6 +138,19 @@ Key points about the planned architecture:
   - Health/readiness probes
   - Grafana dashboard
 - **Comprehensive Tests**: 132+ tests covering all components
+
+## Documentation
+
+Comprehensive documentation is available in the [docs/](docs/) directory:
+
+- **[API_USAGE.md](docs/API_USAGE.md)** - Complete API reference with request/response examples
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - System architecture and design patterns
+- **[FUZZING.md](docs/FUZZING.md)** - Fuzz testing guide and best practices
+- **[OBSERVABILITY.md](docs/OBSERVABILITY.md)** - Metrics, logging, and monitoring
+- **[QUICK_START_S3.md](docs/QUICK_START_S3.md)** - S3-compatible client examples
+- **[S3_COMPATIBILITY_ROADMAP.md](docs/S3_COMPATIBILITY_ROADMAP.md)** - S3 feature implementation status
+- **[STORAGE_ENGINE_PLAN.md](docs/STORAGE_ENGINE_PLAN.md)** - Future storage engine design
+- **[Progress.md](docs/Progress.md)** - Development progress log
 
 ## Quick Start
 
@@ -251,7 +264,7 @@ LOG_FORMAT=json RUST_LOG=info ./target/release/s3ish
 LOG_FORMAT=human RUST_LOG=debug ./target/release/s3ish
 ```
 
-See [OBSERVABILITY.md](OBSERVABILITY.md) for detailed metrics documentation and Grafana integration.
+See [OBSERVABILITY.md](docs/OBSERVABILITY.md) for detailed metrics documentation and Grafana integration.
 
 ## Configuration
 
@@ -276,7 +289,7 @@ storage_backend = "memory"
 - **memory**: Fast in-memory storage (ephemeral)
 - **file**: Persistent filesystem-based storage with optional erasure coding for data redundancy
 
-See [API_USAGE.md](API_USAGE.md) for complete API documentation and [QUICK_START_S3.md](QUICK_START_S3.md) for S3-compatible client examples.
+See [API_USAGE.md](docs/API_USAGE.md) for complete API documentation and [QUICK_START_S3.md](docs/QUICK_START_S3.md) for S3-compatible client examples.
 
 ## Architecture
 
@@ -287,7 +300,7 @@ The project uses a pluggable architecture where protocol handlers (gRPC, HTTP) s
 - **Storage Backends**: In-memory and filesystem with optional erasure coding
 - **Observability**: Prometheus metrics, structured logging, and health checks
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed documentation.
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed documentation.
 
 ## Testing
 
@@ -320,7 +333,7 @@ cargo fuzz run sigv4_parsing -- -max_total_time=60
 cargo fuzz run xml_parsing -- -max_total_time=60
 ```
 
-See [FUZZING.md](FUZZING.md) for detailed fuzzing documentation.
+See [FUZZING.md](docs/FUZZING.md) for detailed fuzzing documentation.
 
 ## License
 

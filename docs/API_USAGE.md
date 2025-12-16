@@ -37,6 +37,58 @@ Requests without valid credentials return:
 - Abort: `DELETE /{bucket}/{key}?uploadId=ID`
 - Errors: `NoSuchUpload` (404), `InvalidPart` (400), `NoSuchBucket`/`NoSuchKey`
 
+### Object Versioning
+S3-compatible object versioning allows multiple versions of the same object to coexist. When enabled, PUT operations create new versions instead of overwriting, and DELETE operations create delete markers.
+
+**Bucket Versioning Status**:
+- Get versioning: `GET /{bucket}?versioning`
+- Enable versioning: `PUT /{bucket}?versioning` with XML body:
+  ```xml
+  <VersioningConfiguration>
+    <Status>Enabled</Status>
+  </VersioningConfiguration>
+  ```
+- Suspend versioning: `PUT /{bucket}?versioning` with `<Status>Suspended</Status>`
+
+**Versioned Object Operations**:
+- Put object (creates new version): `PUT /{bucket}/{key}` — Returns `x-amz-version-id` header
+- Get specific version: `GET /{bucket}/{key}?versionId=VERSION_ID`
+- Head specific version: `HEAD /{bucket}/{key}?versionId=VERSION_ID`
+- Delete specific version: `DELETE /{bucket}/{key}?versionId=VERSION_ID`
+- List all versions: `GET /{bucket}?versions` — Returns `<ListVersionsResult>` XML
+
+**Versioning Behavior**:
+- **Unversioned buckets**: PUT overwrites, DELETE permanently removes
+- **Versioned buckets**: PUT creates new version with `version_id`, DELETE creates delete marker
+- Delete markers: Special version indicating object is deleted (not returned by GET)
+- Latest version: Marked with `is_latest=true`, returned by GET/HEAD/LIST without version ID
+
+**Example: Enable versioning and create versions**:
+```bash
+# Enable versioning
+curl -X PUT "http://localhost:9000/my-bucket?versioning" \
+  -H "x-access-key: test" -H "x-secret-key: pass" \
+  -d '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>'
+
+# Put object (version 1)
+curl -X PUT http://localhost:9000/my-bucket/file.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass" \
+  -d "content v1"
+
+# Put object (version 2 - doesn't overwrite v1)
+curl -X PUT http://localhost:9000/my-bucket/file.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass" \
+  -d "content v2"
+
+# Get latest version
+curl http://localhost:9000/my-bucket/file.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+
+# List all versions
+curl "http://localhost:9000/my-bucket?versions" \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+```
+
 ### Pre-signed URLs
 Pre-signed URLs allow temporary authenticated access to S3 objects without requiring AWS credentials in the request. URLs are signed using AWS Signature V4 and include an expiration time.
 

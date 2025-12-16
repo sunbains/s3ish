@@ -1447,6 +1447,7 @@ impl IntoResponse for S3Error {
 async fn create_bucket(
     State(state): State<S3State>,
     Path(bucket): Path<String>,
+    Query(params): Query<ListObjectsParams>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Bytes,
@@ -1457,6 +1458,28 @@ async fn create_bucket(
     s3_handler
         .authenticate(&Method::PUT, &uri, &headers, &[])
         .await?;
+
+    // Check if this is a PUT versioning status request
+    if params.versioning.is_some() {
+        use crate::storage::VersioningStatus;
+
+        // Parse the versioning configuration XML
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| S3Error::InvalidInput("Invalid XML encoding".to_string()))?;
+
+        let status = if text.contains("<Status>Enabled</Status>") {
+            VersioningStatus::Enabled
+        } else if text.contains("<Status>Suspended</Status>") {
+            VersioningStatus::Suspended
+        } else {
+            return Err(S3Error::InvalidInput("Invalid versioning status".to_string()));
+        };
+
+        state.handler.storage.put_bucket_versioning(&bucket, status).await?;
+
+        let resp = (StatusCode::OK, Body::empty()).into_response();
+        return Ok(attach_common_headers(resp, &state));
+    }
 
     if !body.is_empty() {
         parse_create_bucket_configuration(&body, state.context.region())?;
@@ -1835,6 +1858,7 @@ async fn post_object(
 async fn get_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<ObjectVersionParams>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, S3Error> {
@@ -1845,7 +1869,11 @@ async fn get_object(
         .authenticate(&Method::GET, &uri, &headers, &[])
         .await?;
 
-    let (data, meta) = state.handler.storage.get_object(&bucket, &key).await?;
+    let (data, meta) = if let Some(version_id) = params.version_id {
+        state.handler.storage.get_object_version(&bucket, &key, &version_id).await?
+    } else {
+        state.handler.storage.get_object(&bucket, &key).await?
+    };
 
     // Conditional GET: If-None-Match
     if let Some(if_none) = headers
@@ -2003,6 +2031,7 @@ async fn delete_objects(
 async fn head_object(
     State(state): State<S3State>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<ObjectVersionParams>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, S3Error> {
@@ -2013,7 +2042,11 @@ async fn head_object(
         .authenticate(&Method::HEAD, &uri, &headers, &[])
         .await?;
 
-    let (_data, meta) = state.handler.storage.get_object(&bucket, &key).await?;
+    let meta = if let Some(version_id) = params.version_id {
+        state.handler.storage.head_object_version(&bucket, &key, &version_id).await?
+    } else {
+        state.handler.storage.head_object(&bucket, &key).await?
+    };
 
     if let Some(range_header) = headers.get(header::RANGE) {
         let range_str = range_header
@@ -2092,7 +2125,12 @@ async fn delete_object(
         return Ok(attach_common_headers(resp, &state));
     }
 
-    let deleted = state.handler.storage.delete_object(&bucket, &key).await?;
+    let deleted = if let Some(version_id) = mq.version_id {
+        state.handler.storage.delete_object_version(&bucket, &key, &version_id).await?
+    } else {
+        state.handler.storage.delete_object(&bucket, &key).await?
+    };
+
     if !deleted {
         return Err(S3Error::ObjectNotFound { bucket, key });
     }
@@ -2107,6 +2145,16 @@ struct ListObjectsParams {
     #[serde(default)]
     #[serde(rename = "max-keys")]
     max_keys: Option<u32>,
+    #[serde(default)]
+    versions: Option<String>,  // If present, list all versions
+    #[serde(default)]
+    versioning: Option<String>,  // If present, get/put versioning status
+}
+
+#[derive(Deserialize, Default)]
+struct ObjectVersionParams {
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -2117,6 +2165,8 @@ struct MultipartQuery {
     upload_id: Option<String>,
     #[serde(rename = "partNumber")]
     part_number: Option<u32>,
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -2160,6 +2210,86 @@ async fn list_objects(
     s3_handler
         .authenticate(&Method::GET, &uri, &headers, &[])
         .await?;
+
+    // Check if this is a GET versioning status request
+    if params.versioning.is_some() {
+        use crate::storage::VersioningStatus;
+
+        let status = state.handler.storage.get_bucket_versioning(&bucket).await?;
+
+        let status_str = match status {
+            VersioningStatus::Enabled => "Enabled",
+            VersioningStatus::Suspended => "Suspended",
+            VersioningStatus::Unversioned => "",
+        };
+
+        let xml = if status == VersioningStatus::Unversioned {
+            // Return empty versioning configuration for unversioned buckets
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#
+            )
+        } else {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>{}</Status></VersioningConfiguration>"#,
+                status_str
+            )
+        };
+
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+        return Ok(attach_common_headers(resp, &state));
+    }
+
+    // Check if this is a list versions request
+    if params.versions.is_some() {
+        let limit = params.max_keys.unwrap_or(1000) as usize;
+        let versions = state
+            .handler
+            .storage
+            .list_object_versions(&bucket, &params.prefix, limit)
+            .await?;
+
+        // For now, return simple XML response (TODO: add proper XML renderer)
+        let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        xml.push_str("<ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n");
+        xml.push_str(&format!("  <Name>{}</Name>\n", bucket));
+        xml.push_str(&format!("  <Prefix>{}</Prefix>\n", params.prefix));
+        xml.push_str(&format!("  <MaxKeys>{}</MaxKeys>\n", limit));
+        xml.push_str("  <IsTruncated>false</IsTruncated>\n");
+
+        for ver in versions {
+            if ver.is_delete_marker {
+                xml.push_str("  <DeleteMarker>\n");
+                xml.push_str("    <Key>unknown</Key>\n");  // TODO: Need to track key with version
+                xml.push_str(&format!("    <VersionId>{}</VersionId>\n", ver.version_id.as_deref().unwrap_or("")));
+                xml.push_str(&format!("    <IsLatest>{}</IsLatest>\n", if ver.is_latest { "true" } else { "false" }));
+                xml.push_str(&format!("    <LastModified>{}</LastModified>\n", format_rfc3339(ver.last_modified_unix_secs)));
+                xml.push_str("  </DeleteMarker>\n");
+            } else {
+                xml.push_str("  <Version>\n");
+                xml.push_str("    <Key>unknown</Key>\n");  // TODO: Need to track key with version
+                xml.push_str(&format!("    <VersionId>{}</VersionId>\n", ver.version_id.as_deref().unwrap_or("")));
+                xml.push_str(&format!("    <IsLatest>{}</IsLatest>\n", if ver.is_latest { "true" } else { "false" }));
+                xml.push_str(&format!("    <LastModified>{}</LastModified>\n", format_rfc3339(ver.last_modified_unix_secs)));
+                xml.push_str(&format!("    <ETag>&quot;{}&quot;</ETag>\n", ver.etag));
+                xml.push_str(&format!("    <Size>{}</Size>\n", ver.size));
+                xml.push_str("    <StorageClass>STANDARD</StorageClass>\n");
+                xml.push_str("  </Version>\n");
+            }
+        }
+
+        xml.push_str("</ListVersionsResult>");
+
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+        return Ok(attach_common_headers(resp, &state));
+    }
 
     let limit = params.max_keys.unwrap_or(1000) as usize;
     let objects = state
@@ -4047,5 +4177,194 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_versioning() {
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(InMemoryStorage::new());
+        let auth: Arc<dyn Authenticator> = Arc::new(MockAuthenticator { should_fail: false });
+        let base_handler = BaseHandler::new(auth, storage);
+        let handler = S3HttpHandler::new(base_handler);
+        let app = handler.router();
+
+        // Create bucket
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/versioned-bucket")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Get versioning status (should be unversioned by default)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/versioned-bucket?versioning")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("VersioningConfiguration"));
+
+        // Enable versioning
+        let enable_xml = r#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/versioned-bucket?versioning")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::from(enable_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify versioning is enabled
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/versioned-bucket?versioning")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("<Status>Enabled</Status>"));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_object_operations() {
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(InMemoryStorage::new());
+        let auth: Arc<dyn Authenticator> = Arc::new(MockAuthenticator { should_fail: false });
+        let base_handler = BaseHandler::new(auth, storage);
+        let handler = S3HttpHandler::new(base_handler);
+        let app = handler.router();
+
+        // Create bucket and enable versioning
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/vbucket")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let enable_xml = r#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#;
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/vbucket?versioning")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::from(enable_xml))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Put object version 1
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/vbucket/vkey.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("version1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Put object version 2
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/vbucket/vkey.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("version2"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Get latest version (should be version2)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/vbucket/vkey.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"version2");
+
+        // List versions
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/vbucket?versions")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("ListVersionsResult"));
+        assert!(body_str.contains("<IsLatest>true</IsLatest>"));
     }
 }

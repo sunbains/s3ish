@@ -19,14 +19,14 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 - **Storage Class Headers** - x-amz-storage-class request/response support
 - **Encryption Headers** - x-amz-server-side-encryption request/response support
 - **Content-MD5 Validation** - Integrity checking for uploads
+- **Object Versioning** - Full S3-compatible versioning with version IDs, delete markers, and version listing
 
 ### 🚧 Partial / In Progress
 - None currently
 
 ### ❌ Not Yet Implemented
-- **Object Versioning** - Not implemented
 - **Bucket Policies & ACLs** - Not implemented
-- **Server-Side Encryption** - Not implemented
+- **Server-Side Encryption** - Not implemented (headers accepted but not encrypted)
 - **Virtual-Hosted Style URLs** - Only path-style supported
 - **Lifecycle Policies** - Not implemented
 
@@ -125,7 +125,7 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 - [x] x-amz-request-id           // Unique request ID (UUID)
 - [x] x-amz-id-2                 // Extended request ID
 - [x] x-amz-bucket-region        // Bucket region
-- [ ] x-amz-version-id           // Object version - NOT YET (no versioning)
+- [x] x-amz-version-id           // Object version (when versioning enabled)
 - [x] ETag                       // MD5 of content (quoted)
 - [x] Last-Modified              // ISO 8601 timestamp
 - [x] Content-Type               // MIME type

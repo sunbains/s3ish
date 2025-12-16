@@ -30,6 +30,12 @@ struct StoredMeta {
     storage_class: Option<String>,
     #[serde(default)]
     server_side_encryption: Option<String>,
+    #[serde(default)]
+    version_id: Option<String>,
+    #[serde(default)]
+    is_latest: bool,
+    #[serde(default)]
+    is_delete_marker: bool,
 }
 
 /// Simple filesystem-backed storage. Objects are stored under `root/bucket/key`.
@@ -101,6 +107,54 @@ impl FileStorage {
     fn multipart_meta_path(&self, upload_id: &str) -> PathBuf {
         self.multipart_upload_dir(upload_id).join("upload.meta")
     }
+
+    /// Generate a unique version ID (timestamp-based with nanoseconds)
+    fn generate_version_id() -> String {
+        let now = Utc::now();
+        format!("{}{:09}", now.timestamp(), now.timestamp_subsec_nanos())
+    }
+
+    fn versioning_status_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".versioning")
+    }
+
+    async fn read_versioning_status(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::storage::VersioningStatus, StorageError> {
+        use crate::storage::VersioningStatus;
+        let path = self.versioning_status_path(bucket);
+        match fs::read_to_string(&path).await {
+            Ok(contents) => match contents.trim() {
+                "Enabled" => Ok(VersioningStatus::Enabled),
+                "Suspended" => Ok(VersioningStatus::Suspended),
+                _ => Ok(VersioningStatus::Unversioned),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(VersioningStatus::Unversioned)
+            }
+            Err(e) => Err(StorageError::Internal(format!(
+                "read versioning status: {e}"
+            ))),
+        }
+    }
+
+    async fn write_versioning_status(
+        &self,
+        bucket: &str,
+        status: crate::storage::VersioningStatus,
+    ) -> Result<(), StorageError> {
+        use crate::storage::VersioningStatus;
+        let path = self.versioning_status_path(bucket);
+        let status_str = match status {
+            VersioningStatus::Enabled => "Enabled",
+            VersioningStatus::Suspended => "Suspended",
+            VersioningStatus::Unversioned => "Unversioned",
+        };
+        fs::write(&path, status_str)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write versioning status: {e}")))
+    }
 }
 
 
@@ -113,6 +167,9 @@ fn to_object_metadata(meta: StoredMeta) -> ObjectMetadata {
         metadata: meta.metadata,
         storage_class: meta.storage_class,
         server_side_encryption: meta.server_side_encryption,
+        version_id: meta.version_id,
+        is_latest: meta.is_latest,
+        is_delete_marker: meta.is_delete_marker,
     }
 }
 
@@ -303,6 +360,9 @@ impl StorageBackend for FileStorage {
             block_size: Some(self.erasure.block_size),
             storage_class,
             server_side_encryption,
+            version_id: None,  // TODO: Implement versioning
+            is_latest: true,
+            is_delete_marker: false,
         };
         let meta_bytes =
             serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -714,6 +774,9 @@ impl StorageBackend for FileStorage {
             block_size: stored.block_size,
             storage_class,
             server_side_encryption,
+            version_id: None,  // TODO: Implement versioning
+            is_latest: true,
+            is_delete_marker: false,
         };
         let meta_bytes = serde_json::to_vec(&dest_meta)
             .map_err(|e| StorageError::Internal(format!("encode meta: {e}")))?;
@@ -831,6 +894,86 @@ impl StorageBackend for FileStorage {
         );
 
         Ok(())
+    }
+
+    async fn get_bucket_versioning(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::storage::VersioningStatus, StorageError> {
+        validate_bucket(bucket)?;
+
+        // Check bucket exists
+        let bucket_path = self.bucket_path(bucket);
+        if fs::metadata(&bucket_path).await.is_err() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+
+        self.read_versioning_status(bucket).await
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        bucket: &str,
+        status: crate::storage::VersioningStatus,
+    ) -> Result<(), StorageError> {
+        validate_bucket(bucket)?;
+
+        // Check bucket exists
+        let bucket_path = self.bucket_path(bucket);
+        if fs::metadata(&bucket_path).await.is_err() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+
+        self.write_versioning_status(bucket, status).await
+    }
+
+    async fn get_object_version(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: &str,
+    ) -> Result<(Bytes, ObjectMetadata), StorageError> {
+        // TODO: Implement version-specific storage
+        // For now, return unimplemented error
+        Err(StorageError::Internal(
+            "Object versioning not yet fully implemented for FileStorage".to_string(),
+        ))
+    }
+
+    async fn head_object_version(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: &str,
+    ) -> Result<ObjectMetadata, StorageError> {
+        // TODO: Implement version-specific storage
+        Err(StorageError::Internal(
+            "Object versioning not yet fully implemented for FileStorage".to_string(),
+        ))
+    }
+
+    async fn delete_object_version(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: &str,
+    ) -> Result<bool, StorageError> {
+        // TODO: Implement version-specific storage
+        Err(StorageError::Internal(
+            "Object versioning not yet fully implemented for FileStorage".to_string(),
+        ))
+    }
+
+    async fn list_object_versions(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _limit: usize,
+    ) -> Result<Vec<ObjectMetadata>, StorageError> {
+        // TODO: Implement version-specific storage
+        Err(StorageError::Internal(
+            "Object versioning not yet fully implemented for FileStorage".to_string(),
+        ))
     }
 }
 

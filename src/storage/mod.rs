@@ -17,6 +17,16 @@ pub struct ObjectMetadata {
     pub metadata: HashMap<String, String>,
     pub storage_class: Option<String>,
     pub server_side_encryption: Option<String>,
+    pub version_id: Option<String>,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersioningStatus {
+    Unversioned,
+    Enabled,
+    Suspended,
 }
 
 #[derive(Debug, Error)]
@@ -116,4 +126,41 @@ pub trait StorageBackend: Send + Sync + 'static {
         key: &str,
         upload_id: &str,
     ) -> Result<(), StorageError>;
+
+    // Versioning operations
+    async fn get_bucket_versioning(&self, bucket: &str) -> Result<VersioningStatus, StorageError>;
+
+    async fn put_bucket_versioning(
+        &self,
+        bucket: &str,
+        status: VersioningStatus,
+    ) -> Result<(), StorageError>;
+
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(bytes::Bytes, ObjectMetadata), StorageError>;
+
+    async fn head_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<ObjectMetadata, StorageError>;
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<bool, StorageError>;
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<ObjectMetadata>, StorageError>;
 }

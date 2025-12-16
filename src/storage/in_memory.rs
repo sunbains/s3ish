@@ -2,7 +2,7 @@ use crate::observability::metrics;
 use crate::storage::common::{compute_etag, validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
 use crate::storage::multipart::{InMemoryUpload, MultipartManager, MultipartStorage, PartData, UploadMetadata};
-use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
+use crate::storage::{ObjectMetadata, StorageBackend, StorageError, VersioningStatus};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -19,17 +19,19 @@ struct StoredObject {
     meta: ObjectMetadata,
 }
 
-/// In-memory storage implementation with simulated erasure coding.
+/// In-memory storage implementation with simulated erasure coding and versioning support.
 ///
 /// Data structures:
 /// - `buckets`: a set of bucket names
-/// - `objects`: a BTreeMap keyed by (bucket, key) => StoredObject
+/// - `objects`: a BTreeMap keyed by (bucket, key) => Vec<StoredObject> (multiple versions)
+/// - `bucket_versioning`: versioning status per bucket
 ///
 /// BTreeMap gives deterministic iteration order (useful for tests and predictable listing).
 #[derive(Debug, Clone)]
 pub struct InMemoryStorage {
     buckets: Arc<RwLock<BTreeSet<String>>>,
-    objects: Arc<RwLock<BTreeMap<(String, String), StoredObject>>>,
+    objects: Arc<RwLock<BTreeMap<(String, String), Vec<StoredObject>>>>,
+    bucket_versioning: Arc<RwLock<HashMap<String, VersioningStatus>>>,
     multipart_uploads: Arc<RwLock<HashMap<String, InMemoryUpload>>>,
     erasure: Erasure,
 }
@@ -39,9 +41,16 @@ impl InMemoryStorage {
         Self {
             buckets: Arc::new(RwLock::new(BTreeSet::new())),
             objects: Arc::new(RwLock::new(BTreeMap::new())),
+            bucket_versioning: Arc::new(RwLock::new(HashMap::new())),
             multipart_uploads: Arc::new(RwLock::new(HashMap::new())),
             erasure: Erasure::new(4, 2, ERASURE_CHUNK_SIZE).expect("erasure init"),
         }
+    }
+
+    /// Generate a unique version ID (timestamp-based with nanoseconds)
+    fn generate_version_id() -> String {
+        let now = Utc::now();
+        format!("{}{:09}", now.timestamp(), now.timestamp_subsec_nanos())
     }
 }
 
@@ -114,6 +123,18 @@ impl StorageBackend for InMemoryStorage {
         let (shards, orig_len) = self.erasure.encode(&data)?;
         let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
 
+        // Check if versioning is enabled for this bucket
+        let versioning_status = {
+            let vers = self.bucket_versioning.read().await;
+            *vers.get(bucket).unwrap_or(&VersioningStatus::Unversioned)
+        };
+
+        let version_id = if versioning_status == VersioningStatus::Enabled {
+            Some(Self::generate_version_id())
+        } else {
+            None
+        };
+
         let meta = ObjectMetadata {
             content_type: content_type.to_string(),
             etag,
@@ -122,6 +143,9 @@ impl StorageBackend for InMemoryStorage {
             metadata,
             storage_class,
             server_side_encryption,
+            version_id,
+            is_latest: true,
+            is_delete_marker: false,
         };
 
         // measure lock wait for write
@@ -129,14 +153,28 @@ impl StorageBackend for InMemoryStorage {
         let mut objs = self.objects.write().await;
         metrics::record_lock_wait("object_write", lock_start.elapsed().as_secs_f64());
 
-        objs.insert(
-            (bucket.to_string(), key.to_string()),
-            StoredObject {
-                shards,
-                orig_len,
-                meta: meta.clone(),
-            },
-        );
+        let stored_obj = StoredObject {
+            shards,
+            orig_len,
+            meta: meta.clone(),
+        };
+
+        let obj_key = (bucket.to_string(), key.to_string());
+
+        if versioning_status == VersioningStatus::Enabled {
+            // Mark all previous versions as not latest
+            if let Some(versions) = objs.get_mut(&obj_key) {
+                for v in versions.iter_mut() {
+                    v.meta.is_latest = false;
+                }
+                versions.push(stored_obj);
+            } else {
+                objs.insert(obj_key, vec![stored_obj]);
+            }
+        } else {
+            // Replace the single version
+            objs.insert(obj_key, vec![stored_obj]);
+        }
 
         // Record overall operation metrics
         let duration = start_time.elapsed().as_secs_f64();
@@ -169,12 +207,23 @@ impl StorageBackend for InMemoryStorage {
         let objs = self.objects.read().await;
         metrics::record_lock_wait("object_read", lock_start.elapsed().as_secs_f64());
 
-        let obj = objs
+        let versions = objs
             .get(&(bucket.to_string(), key.to_string()))
             .ok_or_else(|| StorageError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })?;
+
+        // Get the latest version (last in the vector, or find by is_latest flag)
+        let obj = versions
+            .iter()
+            .rev()
+            .find(|v| v.meta.is_latest && !v.meta.is_delete_marker)
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
         let mut shards: Vec<Option<Vec<u8>>> =
             obj.shards.iter().map(|c| Some(c.to_vec())).collect();
         let data = self.erasure.decode(&mut shards, obj.orig_len)?;
@@ -204,22 +253,73 @@ impl StorageBackend for InMemoryStorage {
             }
         }
         let objs = self.objects.read().await;
-        let obj = objs
+        let versions = objs
             .get(&(bucket.to_string(), key.to_string()))
             .ok_or_else(|| StorageError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })?;
+
+        // Get the latest non-delete-marker version
+        let obj = versions
+            .iter()
+            .rev()
+            .find(|v| v.meta.is_latest && !v.meta.is_delete_marker)
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
         Ok(obj.meta.clone())
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
         validate_key(key)?;
+
+        // Check versioning status
+        let versioning_status = {
+            let vers = self.bucket_versioning.read().await;
+            *vers.get(bucket).unwrap_or(&VersioningStatus::Unversioned)
+        };
+
         let mut objs = self.objects.write().await;
-        Ok(objs
-            .remove(&(bucket.to_string(), key.to_string()))
-            .is_some())
+        let obj_key = (bucket.to_string(), key.to_string());
+
+        if versioning_status == VersioningStatus::Enabled {
+            // Create a delete marker instead of actually deleting
+            if let Some(versions) = objs.get_mut(&obj_key) {
+                // Mark all previous versions as not latest
+                for v in versions.iter_mut() {
+                    v.meta.is_latest = false;
+                }
+
+                // Add delete marker
+                let delete_marker = StoredObject {
+                    shards: vec![],
+                    orig_len: 0,
+                    meta: ObjectMetadata {
+                        content_type: String::new(),
+                        etag: String::new(),
+                        size: 0,
+                        last_modified_unix_secs: Utc::now().timestamp(),
+                        metadata: HashMap::new(),
+                        storage_class: None,
+                        server_side_encryption: None,
+                        version_id: Some(Self::generate_version_id()),
+                        is_latest: true,
+                        is_delete_marker: true,
+                    },
+                };
+                versions.push(delete_marker);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            // Permanently delete (unversioned behavior)
+            Ok(objs.remove(&obj_key).is_some())
+        }
     }
 
     async fn list_objects(
@@ -243,14 +343,23 @@ impl StorageBackend for InMemoryStorage {
 
         // Because keys are (bucket, key) sorted lexicographically, we can range-scan.
         let start = (bucket.to_string(), prefix.to_string());
-        for ((b, k), v) in objs.range(start..) {
+        for ((b, k), versions) in objs.range(start..) {
             if b != bucket {
                 break;
             }
             if !k.starts_with(prefix) {
                 break;
             }
-            out.push((k.clone(), v.meta.clone()));
+
+            // Only include the latest non-delete-marker version
+            if let Some(latest) = versions
+                .iter()
+                .rev()
+                .find(|v| v.meta.is_latest && !v.meta.is_delete_marker)
+            {
+                out.push((k.clone(), latest.meta.clone()));
+            }
+
             if out.len() >= limit {
                 break;
             }
@@ -276,27 +385,59 @@ impl StorageBackend for InMemoryStorage {
         validate_key(dest_key)?;
 
         let (data, _meta) = self.get_object(src_bucket, src_key).await?;
-        let etag = format!("{:x}", md5::compute(&data));
+        let etag = compute_etag(&data);
         let (shards, orig_len) = self.erasure.encode(&data)?;
         let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
+
+        // Check if versioning is enabled for destination bucket
+        let versioning_status = {
+            let vers = self.bucket_versioning.read().await;
+            *vers.get(dest_bucket).unwrap_or(&VersioningStatus::Unversioned)
+        };
+
+        let version_id = if versioning_status == VersioningStatus::Enabled {
+            Some(Self::generate_version_id())
+        } else {
+            None
+        };
+
         let meta = ObjectMetadata {
             content_type: content_type.to_string(),
-            etag: etag.clone(),
+            etag,
             size: data.len() as u64,
             last_modified_unix_secs: Utc::now().timestamp(),
             metadata,
             storage_class,
             server_side_encryption,
+            version_id,
+            is_latest: true,
+            is_delete_marker: false,
         };
+
         let mut objs = self.objects.write().await;
-        objs.insert(
-            (dest_bucket.to_string(), dest_key.to_string()),
-            StoredObject {
-                shards,
-                orig_len,
-                meta: meta.clone(),
-            },
-        );
+        let stored_obj = StoredObject {
+            shards,
+            orig_len,
+            meta: meta.clone(),
+        };
+
+        let obj_key = (dest_bucket.to_string(), dest_key.to_string());
+
+        if versioning_status == VersioningStatus::Enabled {
+            // Mark all previous versions as not latest
+            if let Some(versions) = objs.get_mut(&obj_key) {
+                for v in versions.iter_mut() {
+                    v.meta.is_latest = false;
+                }
+                versions.push(stored_obj);
+            } else {
+                objs.insert(obj_key, vec![stored_obj]);
+            }
+        } else {
+            // Replace the single version
+            objs.insert(obj_key, vec![stored_obj]);
+        }
+
         Ok(meta)
     }
 
@@ -406,6 +547,194 @@ impl StorageBackend for InMemoryStorage {
         );
 
         Ok(())
+    }
+
+    async fn get_bucket_versioning(&self, bucket: &str) -> Result<VersioningStatus, StorageError> {
+        validate_bucket(bucket)?;
+
+        // Check bucket exists
+        {
+            let b = self.buckets.read().await;
+            if !b.contains(bucket) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+
+        let vers = self.bucket_versioning.read().await;
+        Ok(*vers.get(bucket).unwrap_or(&VersioningStatus::Unversioned))
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        bucket: &str,
+        status: VersioningStatus,
+    ) -> Result<(), StorageError> {
+        validate_bucket(bucket)?;
+
+        // Check bucket exists
+        {
+            let b = self.buckets.read().await;
+            if !b.contains(bucket) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+
+        let mut vers = self.bucket_versioning.write().await;
+        vers.insert(bucket.to_string(), status);
+        Ok(())
+    }
+
+    async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(Bytes, ObjectMetadata), StorageError> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let objs = self.objects.read().await;
+        let versions = objs
+            .get(&(bucket.to_string(), key.to_string()))
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
+        // Find the specific version
+        let obj = versions
+            .iter()
+            .find(|v| v.meta.version_id.as_ref() == Some(&version_id.to_string()))
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
+        // If it's a delete marker, return ObjectNotFound
+        if obj.meta.is_delete_marker {
+            return Err(StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let mut shards: Vec<Option<Vec<u8>>> =
+            obj.shards.iter().map(|c| Some(c.to_vec())).collect();
+        let data = self.erasure.decode(&mut shards, obj.orig_len)?;
+
+        Ok((Bytes::from(data), obj.meta.clone()))
+    }
+
+    async fn head_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<ObjectMetadata, StorageError> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        {
+            let b = self.buckets.read().await;
+            if !b.contains(bucket) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+
+        let objs = self.objects.read().await;
+        let versions = objs
+            .get(&(bucket.to_string(), key.to_string()))
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
+        // Find the specific version
+        let obj = versions
+            .iter()
+            .find(|v| v.meta.version_id.as_ref() == Some(&version_id.to_string()))
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
+        Ok(obj.meta.clone())
+    }
+
+    async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<bool, StorageError> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let mut objs = self.objects.write().await;
+        let obj_key = (bucket.to_string(), key.to_string());
+
+        if let Some(versions) = objs.get_mut(&obj_key) {
+            // Find the version to delete
+            if let Some(pos) = versions
+                .iter()
+                .position(|v| v.meta.version_id.as_ref() == Some(&version_id.to_string()))
+            {
+                versions.remove(pos);
+
+                // If no versions left, remove the key entirely
+                if versions.is_empty() {
+                    objs.remove(&obj_key);
+                }
+
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<ObjectMetadata>, StorageError> {
+        validate_bucket(bucket)?;
+
+        {
+            let b = self.buckets.read().await;
+            if !b.contains(bucket) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+
+        let limit = if limit == 0 { 1000 } else { limit.min(10_000) };
+
+        let objs = self.objects.read().await;
+        let mut out = Vec::new();
+
+        // Range-scan for keys matching the bucket and prefix
+        let start = (bucket.to_string(), prefix.to_string());
+        for ((b, k), versions) in objs.range(start..) {
+            if b != bucket {
+                break;
+            }
+            if !k.starts_with(prefix) {
+                break;
+            }
+
+            // Include ALL versions (including delete markers) in reverse chronological order
+            for version in versions.iter().rev() {
+                out.push(version.meta.clone());
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -1048,5 +1377,314 @@ mod tests {
         opt_shards[1] = None;
         let recovered = erasure.decode(&mut opt_shards, orig_len).unwrap();
         assert_eq!(Bytes::from(recovered), data);
+    }
+
+    // Versioning tests
+    #[tokio::test]
+    async fn test_versioning_unversioned_by_default() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+
+        let status = storage.get_bucket_versioning("bucket1").await.unwrap();
+        assert_eq!(status, VersioningStatus::Unversioned);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_enable() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+        let status = storage.get_bucket_versioning("bucket1").await.unwrap();
+        assert_eq!(status, VersioningStatus::Enabled);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_creates_versions() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+
+        // Put object twice
+        let meta1 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version1"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta2 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version2"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Both should have version IDs
+        assert!(meta1.version_id.is_some());
+        assert!(meta2.version_id.is_some());
+        assert_ne!(meta1.version_id, meta2.version_id);
+
+        // Latest should be is_latest
+        assert!(meta2.is_latest);
+
+        // Getting the object should return version2
+        let (data, _) = storage.get_object("bucket1", "key1").await.unwrap();
+        assert_eq!(&data[..], b"version2");
+    }
+
+    #[tokio::test]
+    async fn test_versioning_get_specific_version() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version1"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version2"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Get the first version specifically
+        let version_id = meta1.version_id.unwrap();
+        let (data, meta) = storage
+            .get_object_version("bucket1", "key1", &version_id)
+            .await
+            .unwrap();
+
+        assert_eq!(&data[..], b"version1");
+        assert_eq!(meta.version_id.as_ref(), Some(&version_id));
+        assert!(!meta.is_latest);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_delete_marker() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+
+        storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete should create a delete marker
+        let deleted = storage.delete_object("bucket1", "key1").await.unwrap();
+        assert!(deleted);
+
+        // Getting the object should now return NotFound
+        let result = storage.get_object("bucket1", "key1").await;
+        assert!(matches!(result, Err(StorageError::ObjectNotFound { .. })));
+
+        // List versions should show both the object and delete marker
+        let versions = storage
+            .list_object_versions("bucket1", "", 100)
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions[0].is_delete_marker);
+        assert!(!versions[1].is_delete_marker);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_delete_specific_version() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version1"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version2"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete specific version
+        let version_id = meta1.version_id.unwrap();
+        let deleted = storage
+            .delete_object_version("bucket1", "key1", &version_id)
+            .await
+            .unwrap();
+        assert!(deleted);
+
+        // Try to get that version - should fail
+        let result = storage
+            .get_object_version("bucket1", "key1", &version_id)
+            .await;
+        assert!(matches!(result, Err(StorageError::ObjectNotFound { .. })));
+
+        // Latest version should still be available
+        let (data, _) = storage.get_object("bucket1", "key1").await.unwrap();
+        assert_eq!(&data[..], b"version2");
+    }
+
+    #[tokio::test]
+    async fn test_versioning_list_all_versions() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+
+        // Create multiple versions
+        for i in 1..=3 {
+            storage
+                .put_object(
+                    "bucket1",
+                    "key1",
+                    Bytes::from(format!("version{}", i)),
+                    "text/plain",
+                    HashMap::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let versions = storage
+            .list_object_versions("bucket1", "", 100)
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 3);
+        // Should be in reverse chronological order (newest first)
+        assert!(versions[0].is_latest);
+        assert!(!versions[1].is_latest);
+        assert!(!versions[2].is_latest);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_unversioned_overwrites() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        // Don't enable versioning
+
+        let meta1 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version1"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta2 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version2"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Neither should have version IDs
+        assert!(meta1.version_id.is_none());
+        assert!(meta2.version_id.is_none());
+
+        // Only one version should exist
+        let versions = storage
+            .list_object_versions("bucket1", "", 100)
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+
+        // Get should return version2
+        let (data, _) = storage.get_object("bucket1", "key1").await.unwrap();
+        assert_eq!(&data[..], b"version2");
+    }
+
+    #[tokio::test]
+    async fn test_versioning_head_object_version() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("bucket1").await.unwrap();
+        storage.put_bucket_versioning("bucket1", VersioningStatus::Enabled).await.unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("version1"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let version_id = meta1.version_id.as_ref().unwrap();
+        let head_meta = storage
+            .head_object_version("bucket1", "key1", version_id)
+            .await
+            .unwrap();
+
+        assert_eq!(head_meta.version_id.as_ref(), Some(version_id));
+        assert_eq!(head_meta.size, 8); // "version1" length
     }
 }

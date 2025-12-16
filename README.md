@@ -111,7 +111,16 @@ Once you decide that the Raft log is the source of truth, everything else become
 
 ## Current Status
 
-The current implementation provides the S3-compatible foundation layer with pluggable storage backends. The Raft log and ARIES-based storage engine are planned future enhancements.
+The current implementation provides the S3-compatible foundation layer with pluggable storage backends. The log-authoritative ARIES-based storage engine is planned for future implementation.
+
+**See [STORAGE_ENGINE_PLAN.md](STORAGE_ENGINE_PLAN.md) for the detailed implementation plan.**
+
+Key points about the planned architecture:
+- **External orchestrator**: Consensus/Raft layer is handled externally and provides ordered log entries
+- **Storage engine**: Receives sequentially-ordered log entries (by timestamp, LSN, HLC, or any monotonically increasing number) and maintains hot/cold tiers
+- **ARIES recovery**: Write-ahead logging with redo/undo for durability
+- **Asynchronous S3 shipping**: Background process ships sealed segments to S3
+- **Bounded lag**: S3 HWM always ≤ orchestrator LWM
 
 ## Features
 

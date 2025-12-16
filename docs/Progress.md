@@ -102,3 +102,19 @@
     - Updated all relevant documentation references
   - **Test Results**: All 115 tests passing (113 original + 9 InMemoryStorage versioning + 2 HTTP versioning + 1 gRPC update)
   - **Implementation Status**: Versioning fully functional for InMemoryStorage, partial for FileStorage (bucket status only)
+- 2025-12-16: Completed FileStorage versioning implementation:
+  - **Storage Layer (FileStorage)**:
+    - Added versioned path structure: `bucket/key/.versions/{version_id}/meta.json` and `bucket/key/.versions/{version_id}/data.shards/`
+    - Added helper methods: `versions_dir()`, `version_meta_path()`, `version_shard_dir()`, `list_version_ids()`, `find_latest_version()`, `read_shards_from_dir()`
+    - Updated `put_object()` to check versioning status and store in versioned directory structure when enabled, generate version IDs
+    - Updated `get_object()` and `head_object()` to find latest non-delete-marker version, fall back to non-versioned paths for backward compatibility
+    - Updated `delete_object()` to create delete markers in versioned directory when versioning enabled
+    - Updated `list_objects()` to check for `.versions` directories and return latest non-deleted versions alongside traditional objects
+    - Updated `copy_object()` to handle versioned source and destination paths, check versioning status for destination
+    - Implemented `get_object_version()` - retrieve specific version by version ID from versioned path
+    - Implemented `head_object_version()` - get metadata for specific version
+    - Implemented `delete_object_version()` - permanently delete specific version (not a delete marker)
+    - Implemented `list_object_versions()` - list all versions including delete markers for objects with prefix filter
+  - **Backward Compatibility**: Unversioned objects stored at traditional paths (`bucket/key.meta`, `bucket/key.shards/`) continue to work
+  - **Test Results**: All 142 tests passing (115 unit + 27 integration)
+  - **Implementation Status**: Versioning fully functional for both InMemoryStorage and FileStorage

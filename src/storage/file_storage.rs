@@ -118,6 +118,158 @@ impl FileStorage {
         self.bucket_path(bucket).join(".versioning")
     }
 
+    /// Get the versions directory for an object (e.g., bucket/key/.versions/)
+    fn versions_dir(&self, bucket: &str, key: &str) -> PathBuf {
+        let obj_path = self.object_path(bucket, key);
+        obj_path.with_extension("").join(".versions")
+    }
+
+    /// Get the metadata path for a specific version
+    fn version_meta_path(&self, bucket: &str, key: &str, version_id: &str) -> PathBuf {
+        self.versions_dir(bucket, key)
+            .join(version_id)
+            .join("meta.json")
+    }
+
+    /// Get the shard directory for a specific version
+    fn version_shard_dir(&self, bucket: &str, key: &str, version_id: &str) -> PathBuf {
+        self.versions_dir(bucket, key)
+            .join(version_id)
+            .join("data.shards")
+    }
+
+    /// List all version IDs for an object (sorted newest first)
+    async fn list_version_ids(&self, bucket: &str, key: &str) -> Result<Vec<String>, StorageError> {
+        let versions_dir = self.versions_dir(bucket, key);
+        if fs::metadata(&versions_dir).await.is_err() {
+            return Ok(Vec::new());
+        }
+
+        let mut version_ids = Vec::new();
+        let mut rd = fs::read_dir(&versions_dir)
+            .await
+            .map_err(|e| StorageError::Internal(format!("list versions: {e}")))?;
+
+        while let Some(entry) = rd
+            .next_entry()
+            .await
+            .map_err(|e| StorageError::Internal(format!("list versions: {e}")))?
+        {
+            let meta = entry
+                .metadata()
+                .await
+                .map_err(|e| StorageError::Internal(format!("version meta: {e}")))?;
+            if meta.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    version_ids.push(name.to_string());
+                }
+            }
+        }
+
+        // Sort by version ID descending (newest first, since version IDs are timestamp-based)
+        version_ids.sort_by(|a, b| b.cmp(a));
+        Ok(version_ids)
+    }
+
+    /// Find the latest non-delete-marker version
+    async fn find_latest_version(&self, bucket: &str, key: &str) -> Result<Option<StoredMeta>, StorageError> {
+        let version_ids = self.list_version_ids(bucket, key).await?;
+
+        for version_id in version_ids {
+            let meta_path = self.version_meta_path(bucket, key, &version_id);
+            if let Ok(stored) = read_stored_meta(&meta_path).await {
+                if !stored.is_delete_marker {
+                    return Ok(Some(stored));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Read and decode shards from a directory
+    async fn read_shards_from_dir(&self, shard_dir: &Path, db: usize, pb: usize, size: u64) -> Result<Vec<u8>, StorageError> {
+        let total = db + pb.max(1);
+        let mut readers = Vec::new();
+        for idx in 0..total {
+            let shard_path = shard_dir.join(format!("{idx}"));
+            match fs::File::open(&shard_path).await {
+                Ok(f) => readers.push(Some(f)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => readers.push(None),
+                Err(e) => return Err(StorageError::Internal(format!("open shard {idx}: {e}"))),
+            }
+        }
+        // streaming decode
+        let mut out = Vec::with_capacity(size as usize);
+        let mut offset = 0usize;
+        while offset < size as usize {
+            let mut parity_block = vec![0u8; self.erasure.block_size];
+            let mut blocks: Vec<Option<Vec<u8>>> = Vec::new();
+            for reader_opt in readers.iter_mut().take(db) {
+                if let Some(f) = reader_opt {
+                    let mut buf = vec![0u8; self.erasure.block_size];
+                    let n = f
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| StorageError::Internal(format!("read shard: {e}")))?;
+                    buf.truncate(n);
+                    for (i, b) in buf.iter().enumerate() {
+                        parity_block[i] ^= b;
+                    }
+                    blocks.push(Some(buf));
+                } else {
+                    blocks.push(None);
+                }
+            }
+            // parity shard
+            if let Some(parity_file) = readers[total - 1].as_mut() {
+                let mut buf = vec![0u8; self.erasure.block_size];
+                let n = parity_file
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("read parity: {e}")))?;
+                buf.truncate(n);
+                parity_block = buf;
+            }
+
+            // reconstruct if exactly one missing
+            let missing_idx =
+                blocks
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
+            if let Some(miss) = missing_idx {
+                if pb == 0 {
+                    return Err(StorageError::Internal("missing shard".into()));
+                }
+                let mut rec = parity_block.clone();
+                for (i, blk) in blocks.iter().enumerate() {
+                    if i == miss {
+                        continue;
+                    }
+                    if let Some(b) = blk {
+                        for (j, byte) in b.iter().enumerate() {
+                            rec[j] ^= byte;
+                        }
+                    }
+                }
+                blocks[miss] = Some(rec);
+            }
+
+            for mut b in blocks.into_iter().take(db).flatten() {
+                if out.len() + b.len() > size as usize {
+                    b.truncate(size as usize - out.len());
+                }
+                out.extend_from_slice(&b);
+                if out.len() >= size as usize {
+                    break;
+                }
+            }
+            offset = out.len();
+        }
+        Ok(out)
+    }
+
     async fn read_versioning_status(
         &self,
         bucket: &str,
@@ -273,15 +425,37 @@ impl StorageBackend for FileStorage {
         let fs_check_duration = fs_check_start.elapsed().as_secs_f64();
         tracing::debug!(fs_check_ms = fs_check_duration * 1000.0, "Bucket existence check");
 
-        let obj_path = self.object_path(bucket, key);
-        if let Some(parent) = obj_path.parent() {
+        // Check versioning status
+        let versioning_status = self.read_versioning_status(bucket).await?;
+        let is_versioned = versioning_status == crate::storage::VersioningStatus::Enabled;
+
+        let (version_id, shard_dir, meta_path) = if is_versioned {
+            // Versioning enabled: generate version ID and use versioned paths
+            let vid = Self::generate_version_id();
+            let shard_dir = self.version_shard_dir(bucket, key, &vid);
+            let meta_path = self.version_meta_path(bucket, key, &vid);
+            (Some(vid), shard_dir, meta_path)
+        } else {
+            // Unversioned: use traditional paths
+            let obj_path = self.object_path(bucket, key);
+            if let Some(parent) = obj_path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("create parents: {e}")))?;
+            }
+            let shard_dir = self.shard_dir(&obj_path);
+            let meta_path = self.meta_path(&obj_path);
+            (None, shard_dir, meta_path)
+        };
+
+        // Ensure parent directory exists for versioned paths
+        if let Some(parent) = meta_path.parent() {
             fs::create_dir_all(parent)
                 .await
-                .map_err(|e| StorageError::Internal(format!("create parents: {e}")))?;
+                .map_err(|e| StorageError::Internal(format!("create version parents: {e}")))?;
         }
 
         // Encode shards streaming: write data shards and XOR parity shard(s).
-        let shard_dir = self.shard_dir(&obj_path);
         if shard_dir.exists() {
             let _ = fs::remove_dir_all(&shard_dir).await;
         }
@@ -360,13 +534,12 @@ impl StorageBackend for FileStorage {
             block_size: Some(self.erasure.block_size),
             storage_class,
             server_side_encryption,
-            version_id: None,  // TODO: Implement versioning
+            version_id: version_id.clone(),
             is_latest: true,
             is_delete_marker: false,
         };
         let meta_bytes =
             serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
-        let meta_path = self.meta_path(&obj_path);
         fs::write(&meta_path, meta_bytes)
             .await
             .map_err(|e| StorageError::Internal(format!("write meta: {e}")))?;
@@ -379,6 +552,7 @@ impl StorageBackend for FileStorage {
             bucket = %bucket,
             key = %key,
             size = size,
+            version_id = ?version_id,
             duration_ms = duration * 1000.0,
             "FileStorage put object completed"
         );
@@ -396,6 +570,36 @@ impl StorageBackend for FileStorage {
 
         validate_bucket(bucket)?;
         validate_key(key)?;
+
+        // Try to find latest versioned object first
+        if let Some(stored) = self.find_latest_version(bucket, key).await? {
+            let version_id = stored.version_id.as_ref().ok_or_else(|| {
+                StorageError::Internal("version found but no version_id".to_string())
+            })?;
+
+            // Read data from versioned path
+            let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
+                let shard_dir = self.version_shard_dir(bucket, key, version_id);
+                self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?
+            } else {
+                // Fallback for objects without shards (shouldn't happen for versioned objects)
+                return Err(StorageError::Internal("versioned object missing shards".to_string()));
+            };
+
+            let duration = start_time.elapsed().as_secs_f64();
+            metrics::record_storage_op("get", "file", duration);
+            tracing::debug!(
+                bucket = %bucket,
+                key = %key,
+                version_id = %version_id,
+                size = data.len(),
+                duration_ms = duration * 1000.0,
+                "FileStorage get versioned object completed"
+            );
+            return Ok((Bytes::from(data), to_object_metadata(stored)));
+        }
+
+        // Fall back to non-versioned path for backward compatibility
         let obj_path = self.object_path(bucket, key);
         let meta_path = self.meta_path(&obj_path);
 
@@ -411,85 +615,7 @@ impl StorageBackend for FileStorage {
         tracing::debug!(meta_read_ms = meta_read_start.elapsed().as_secs_f64() * 1000.0, "Metadata read");
         let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
             let shard_dir = self.shard_dir(&obj_path);
-            let total = db + pb.max(1);
-            let mut readers = Vec::new();
-            for idx in 0..total {
-                let shard_path = shard_dir.join(format!("{idx}"));
-                match fs::File::open(&shard_path).await {
-                    Ok(f) => readers.push(Some(f)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => readers.push(None),
-                    Err(e) => return Err(StorageError::Internal(format!("open shard {idx}: {e}"))),
-                }
-            }
-            // streaming decode
-            let mut out = Vec::with_capacity(stored.size as usize);
-            let mut offset = 0usize;
-            while offset < stored.size as usize {
-                let mut parity_block = vec![0u8; self.erasure.block_size];
-                let mut blocks: Vec<Option<Vec<u8>>> = Vec::new();
-                for reader_opt in readers.iter_mut().take(db) {
-                    if let Some(f) = reader_opt {
-                        let mut buf = vec![0u8; self.erasure.block_size];
-                        let n = f
-                            .read(&mut buf)
-                            .await
-                            .map_err(|e| StorageError::Internal(format!("read shard: {e}")))?;
-                        buf.truncate(n);
-                        for (i, b) in buf.iter().enumerate() {
-                            parity_block[i] ^= b;
-                        }
-                        blocks.push(Some(buf));
-                    } else {
-                        blocks.push(None);
-                    }
-                }
-                // parity shard
-                if let Some(parity_file) = readers[total - 1].as_mut() {
-                    let mut buf = vec![0u8; self.erasure.block_size];
-                    let n = parity_file
-                        .read(&mut buf)
-                        .await
-                        .map_err(|e| StorageError::Internal(format!("read parity: {e}")))?;
-                    buf.truncate(n);
-                    parity_block = buf;
-                }
-
-                // reconstruct if exactly one missing
-                let missing_idx =
-                    blocks
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
-                if let Some(miss) = missing_idx {
-                    if pb == 0 {
-                        return Err(StorageError::Internal("missing shard".into()));
-                    }
-                    let mut rec = parity_block.clone();
-                    for (i, blk) in blocks.iter().enumerate() {
-                        if i == miss {
-                            continue;
-                        }
-                        if let Some(b) = blk {
-                            for (j, byte) in b.iter().enumerate() {
-                                rec[j] ^= byte;
-                            }
-                        }
-                    }
-                    blocks[miss] = Some(rec);
-                }
-
-                for mut b in blocks.into_iter().take(db).flatten() {
-                    if out.len() + b.len() > stored.size as usize {
-                        b.truncate(stored.size as usize - out.len());
-                    }
-                    out.extend_from_slice(&b);
-                    if out.len() >= stored.size as usize {
-                        break;
-                    }
-                }
-                offset = out.len();
-            }
-            out
+            self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?
         } else {
             fs::read(&obj_path).await.map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {
@@ -521,6 +647,24 @@ impl StorageBackend for FileStorage {
 
         validate_bucket(bucket)?;
         validate_key(key)?;
+
+        // Try to find latest versioned object first
+        if let Some(stored) = self.find_latest_version(bucket, key).await? {
+            let duration = start_time.elapsed().as_secs_f64();
+            metrics::record_storage_op("head", "file", duration);
+
+            tracing::debug!(
+                bucket = %bucket,
+                key = %key,
+                version_id = ?stored.version_id,
+                duration_ms = (duration * 1000.0) as u64,
+                "head versioned object completed"
+            );
+
+            return Ok(to_object_metadata(stored));
+        }
+
+        // Fall back to non-versioned path for backward compatibility
         let obj_path = self.object_path(bucket, key);
         let meta_path = self.meta_path(&obj_path);
         let stored = read_stored_meta(&meta_path).await.map_err(|e| match e {
@@ -550,6 +694,60 @@ impl StorageBackend for FileStorage {
 
         validate_bucket(bucket)?;
         validate_key(key)?;
+
+        // Check versioning status
+        let versioning_status = self.read_versioning_status(bucket).await?;
+        let is_versioned = versioning_status == crate::storage::VersioningStatus::Enabled;
+
+        if is_versioned {
+            // Create a delete marker instead of actually deleting
+            let version_id = Self::generate_version_id();
+            let meta_path = self.version_meta_path(bucket, key, &version_id);
+
+            // Ensure parent directory exists
+            if let Some(parent) = meta_path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("create version parents: {e}")))?;
+            }
+
+            let delete_marker_meta = StoredMeta {
+                content_type: "application/octet-stream".to_string(),
+                etag: "".to_string(),
+                size: 0,
+                last_modified_unix_secs: Utc::now().timestamp(),
+                metadata: HashMap::new(),
+                data_blocks: None,
+                parity_blocks: None,
+                block_size: None,
+                storage_class: None,
+                server_side_encryption: None,
+                version_id: Some(version_id.clone()),
+                is_latest: true,
+                is_delete_marker: true,
+            };
+
+            let meta_bytes = serde_json::to_vec(&delete_marker_meta)
+                .map_err(|e| StorageError::Internal(e.to_string()))?;
+            fs::write(&meta_path, meta_bytes)
+                .await
+                .map_err(|e| StorageError::Internal(format!("write delete marker: {e}")))?;
+
+            let duration = start_time.elapsed().as_secs_f64();
+            metrics::record_storage_op("delete", "file", duration);
+
+            tracing::debug!(
+                bucket = %bucket,
+                key = %key,
+                version_id = %version_id,
+                duration_ms = (duration * 1000.0) as u64,
+                "created delete marker"
+            );
+
+            return Ok(true);
+        }
+
+        // Unversioned: permanently delete
         let obj_path = self.object_path(bucket, key);
         let meta_path = self.meta_path(&obj_path);
         let shard_dir = self.shard_dir(&obj_path);
@@ -620,7 +818,29 @@ impl StorageBackend for FileStorage {
                     dirs.push(path);
                     continue;
                 }
-                if path.extension().and_then(|e| e.to_str()) == Some("meta") {
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if dir_name == ".versions" {
+                    // Found a versions directory - get the latest non-delete-marker version
+                    let parent_path = path.parent().ok_or_else(|| {
+                        StorageError::Internal("versions dir has no parent".to_string())
+                    })?;
+                    let key_path = parent_path
+                        .strip_prefix(self.bucket_path(bucket))
+                        .map_err(|_| StorageError::Internal("strip prefix failed".into()))?;
+                    let key_str = key_path.to_string_lossy().replace('\\', "/");
+
+                    if !key_str.starts_with(prefix) {
+                        continue;
+                    }
+
+                    if let Some(stored) = self.find_latest_version(bucket, &key_str).await? {
+                        out.push((key_str, to_object_metadata(stored)));
+                        if out.len() >= limit {
+                            return Ok(out);
+                        }
+                    }
+                } else if path.extension().and_then(|e| e.to_str()) == Some("meta") {
+                    // Regular unversioned .meta file
                     let rel = path
                         .strip_prefix(self.bucket_path(bucket))
                         .map_err(|_| StorageError::Internal("strip prefix failed".into()))?;
@@ -694,34 +914,61 @@ impl StorageBackend for FileStorage {
             return Err(StorageError::BucketNotFound(dest_bucket.to_string()));
         }
 
-        let src_obj_path = self.object_path(src_bucket, src_key);
-        let dest_obj_path = self.object_path(dest_bucket, dest_key);
-        if let Some(parent) = dest_obj_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::Internal(format!("create dest parents: {e}")))?;
-        }
+        // Check dest versioning status early to determine paths
+        let dest_versioning_status = self.read_versioning_status(dest_bucket).await?;
+        let is_dest_versioned = dest_versioning_status == crate::storage::VersioningStatus::Enabled;
+        let dest_version_id = if is_dest_versioned {
+            Some(Self::generate_version_id())
+        } else {
+            None
+        };
 
-        let src_meta_path = self.meta_path(&src_obj_path);
-        let stored = read_stored_meta(&src_meta_path)
-            .await
-            .map_err(|e| match e {
+        // Read source metadata (handles both versioned and non-versioned sources)
+        let (_, src_meta) = self.get_object(src_bucket, src_key).await?;
+        let stored = if let Some(ref src_vid) = src_meta.version_id {
+            // Source is versioned
+            let src_meta_path = self.version_meta_path(src_bucket, src_key, src_vid);
+            read_stored_meta(&src_meta_path).await.map_err(|e| match e {
                 StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
                     bucket: src_bucket.to_string(),
                     key: src_key.to_string(),
                 },
                 other => other,
-            })?;
+            })?
+        } else {
+            // Source is unversioned
+            let src_obj_path = self.object_path(src_bucket, src_key);
+            let src_meta_path = self.meta_path(&src_obj_path);
+            read_stored_meta(&src_meta_path).await.map_err(|e| match e {
+                StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
+                    bucket: src_bucket.to_string(),
+                    key: src_key.to_string(),
+                },
+                other => other,
+            })?
+        };
 
         // Copy shards directly to avoid buffering the whole object.
         if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
-            let src_shard_dir = self.shard_dir(&src_obj_path);
+            let src_shard_dir = if let Some(src_vid) = &src_meta.version_id {
+                self.version_shard_dir(src_bucket, src_key, src_vid)
+            } else {
+                let src_obj_path = self.object_path(src_bucket, src_key);
+                self.shard_dir(&src_obj_path)
+            };
+
             if fs::metadata(&src_shard_dir).await.is_err() {
                 return Err(StorageError::Internal(format!(
                     "shards missing for {src_bucket}/{src_key}"
                 )));
             }
-            let dest_shard_dir = self.shard_dir(&dest_obj_path);
+
+            let dest_shard_dir = if let Some(ref dest_vid) = dest_version_id {
+                self.version_shard_dir(dest_bucket, dest_key, dest_vid)
+            } else {
+                let dest_obj_path = self.object_path(dest_bucket, dest_key);
+                self.shard_dir(&dest_obj_path)
+            };
             let tmp_shard_dir = dest_shard_dir.with_extension("tmpcopy");
             let _ = remove_dir_all(&tmp_shard_dir).await;
             fs::create_dir_all(&tmp_shard_dir)
@@ -758,6 +1005,14 @@ impl StorageBackend for FileStorage {
             // Silence unused warnings for db/pb when metadata is missing.
             let _ = (db, pb);
         } else {
+            // Handle non-sharded copy (shouldn't happen in production but keep for compatibility)
+            let src_obj_path = self.object_path(src_bucket, src_key);
+            let dest_obj_path = self.object_path(dest_bucket, dest_key);
+            if let Some(parent) = dest_obj_path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("create dest parents: {e}")))?;
+            }
             tokio::fs::copy(&src_obj_path, &dest_obj_path)
                 .await
                 .map_err(|e| StorageError::Internal(format!("copy object: {e}")))?;
@@ -774,13 +1029,27 @@ impl StorageBackend for FileStorage {
             block_size: stored.block_size,
             storage_class,
             server_side_encryption,
-            version_id: None,  // TODO: Implement versioning
+            version_id: dest_version_id.clone(),
             is_latest: true,
             is_delete_marker: false,
         };
         let meta_bytes = serde_json::to_vec(&dest_meta)
             .map_err(|e| StorageError::Internal(format!("encode meta: {e}")))?;
-        let dest_meta_path = self.meta_path(&dest_obj_path);
+
+        let dest_meta_path = if let Some(ref dest_vid) = dest_version_id {
+            self.version_meta_path(dest_bucket, dest_key, dest_vid)
+        } else {
+            let dest_obj_path = self.object_path(dest_bucket, dest_key);
+            self.meta_path(&dest_obj_path)
+        };
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest_meta_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StorageError::Internal(format!("create dest meta parents: {e}")))?;
+        }
+
         fs::write(&dest_meta_path, meta_bytes)
             .await
             .map_err(|e| StorageError::Internal(format!("write dest meta: {e}")))?;
@@ -929,51 +1198,155 @@ impl StorageBackend for FileStorage {
 
     async fn get_object_version(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version_id: &str,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
     ) -> Result<(Bytes, ObjectMetadata), StorageError> {
-        // TODO: Implement version-specific storage
-        // For now, return unimplemented error
-        Err(StorageError::Internal(
-            "Object versioning not yet fully implemented for FileStorage".to_string(),
-        ))
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+        let stored = read_stored_meta(&meta_path).await.map_err(|e| match e {
+            StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => other,
+        })?;
+
+        if stored.is_delete_marker {
+            return Err(StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
+            let shard_dir = self.version_shard_dir(bucket, key, version_id);
+            self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?
+        } else {
+            return Err(StorageError::Internal("versioned object missing shards".to_string()));
+        };
+
+        Ok((Bytes::from(data), to_object_metadata(stored)))
     }
 
     async fn head_object_version(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version_id: &str,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
     ) -> Result<ObjectMetadata, StorageError> {
-        // TODO: Implement version-specific storage
-        Err(StorageError::Internal(
-            "Object versioning not yet fully implemented for FileStorage".to_string(),
-        ))
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+        let stored = read_stored_meta(&meta_path).await.map_err(|e| match e {
+            StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            other => other,
+        })?;
+
+        Ok(to_object_metadata(stored))
     }
 
     async fn delete_object_version(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _version_id: &str,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
     ) -> Result<bool, StorageError> {
-        // TODO: Implement version-specific storage
-        Err(StorageError::Internal(
-            "Object versioning not yet fully implemented for FileStorage".to_string(),
-        ))
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+        let shard_dir = self.version_shard_dir(bucket, key, version_id);
+
+        // Delete metadata file
+        let meta_deleted = match fs::remove_file(&meta_path).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(StorageError::Internal(format!("delete version meta: {e}"))),
+        };
+
+        // Delete shard directory
+        let _ = remove_dir_all(&shard_dir).await;
+
+        // Delete version directory if empty
+        if let Some(version_dir) = meta_path.parent() {
+            let _ = fs::remove_dir(version_dir).await;
+        }
+
+        Ok(meta_deleted)
     }
 
     async fn list_object_versions(
         &self,
-        _bucket: &str,
-        _prefix: &str,
-        _limit: usize,
+        bucket: &str,
+        prefix: &str,
+        limit: usize,
     ) -> Result<Vec<ObjectMetadata>, StorageError> {
-        // TODO: Implement version-specific storage
-        Err(StorageError::Internal(
-            "Object versioning not yet fully implemented for FileStorage".to_string(),
-        ))
+        validate_bucket(bucket)?;
+        let bucket_path = self.bucket_path(bucket);
+        if fs::metadata(&bucket_path).await.is_err() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+
+        let limit = if limit == 0 { 1000 } else { limit.min(10_000) };
+        let mut versions = Vec::new();
+        let mut dirs = vec![bucket_path];
+
+        while let Some(dir) = dirs.pop() {
+            let mut rd = fs::read_dir(&dir)
+                .await
+                .map_err(|e| StorageError::Internal(format!("list versions: {e}")))?;
+
+            while let Some(entry) = rd
+                .next_entry()
+                .await
+                .map_err(|e| StorageError::Internal(format!("list versions: {e}")))?
+            {
+                let path = entry.path();
+                let meta = entry
+                    .metadata()
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("list versions meta: {e}")))?;
+
+                if meta.is_dir() {
+                    let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if dir_name == ".versions" {
+                        // Found a versions directory - list all versions in it
+                        let parent_path = path.parent().unwrap();
+                        let key_path = parent_path
+                            .strip_prefix(&self.bucket_path(bucket))
+                            .map_err(|_| StorageError::Internal("strip prefix failed".into()))?;
+                        let key_str = key_path.to_string_lossy().replace('\\', "/");
+
+                        if !key_str.starts_with(prefix) {
+                            continue;
+                        }
+
+                        // List all version IDs for this key
+                        let version_ids = self.list_version_ids(bucket, &key_str).await?;
+                        for version_id in version_ids {
+                            let meta_path = self.version_meta_path(bucket, &key_str, &version_id);
+                            if let Ok(stored) = read_stored_meta(&meta_path).await {
+                                versions.push(to_object_metadata(stored));
+                                if versions.len() >= limit {
+                                    return Ok(versions);
+                                }
+                            }
+                        }
+                    } else if !dir_name.ends_with(".shards") {
+                        dirs.push(path);
+                    }
+                }
+            }
+        }
+
+        Ok(versions)
     }
 }
 

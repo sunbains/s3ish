@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use s3ish::config::Config;
 use s3ish::storage::file_storage::FileStorage;
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
@@ -65,6 +66,23 @@ impl PerfResults {
         println!("P99 Latency:          {:.2} ms", self.p99_latency_ms);
         println!("{}", "=".repeat(80));
     }
+}
+
+/// Load performance test configuration from TOML file
+fn load_perf_config() -> Config {
+    let config_path = "tests/perf-test-config.toml";
+    Config::from_path(config_path).unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to load {}: {}", config_path, e);
+        eprintln!("Using default configuration");
+        Config {
+            listen_addr: "127.0.0.1:9999".to_string(),
+            auth_file: "./creds.txt".to_string(),
+            region: "us-east-1".to_string(),
+            request_id_prefix: "req-".to_string(),
+            storage: Default::default(),
+            lifecycle: Default::default(),
+        }
+    })
 }
 
 /// Create test data of specified size
@@ -320,8 +338,18 @@ async fn perf_inmemory_concurrent_gets() {
 #[tokio::test]
 #[ignore]
 async fn perf_file_small_objects_sequential() {
+    let cfg = load_perf_config();
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(FileStorage::new(temp_dir.path()).await.unwrap());
+    let storage = Arc::new(
+        FileStorage::new_multi_drive(
+            vec![temp_dir.path().to_path_buf()],
+            cfg.storage.erasure.data_blocks,
+            cfg.storage.erasure.parity_blocks,
+            cfg.storage.erasure.block_size,
+        )
+        .await
+        .unwrap()
+    );
     let config = PerfConfig {
         name: "FileStorage - Small Objects (1KB) - Sequential",
         object_size: 1024,
@@ -339,8 +367,18 @@ async fn perf_file_small_objects_sequential() {
 #[tokio::test]
 #[ignore]
 async fn perf_file_medium_objects_sequential() {
+    let cfg = load_perf_config();
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(FileStorage::new(temp_dir.path()).await.unwrap());
+    let storage = Arc::new(
+        FileStorage::new_multi_drive(
+            vec![temp_dir.path().to_path_buf()],
+            cfg.storage.erasure.data_blocks,
+            cfg.storage.erasure.parity_blocks,
+            cfg.storage.erasure.block_size,
+        )
+        .await
+        .unwrap()
+    );
     let config = PerfConfig {
         name: "FileStorage - Medium Objects (1MB) - Sequential",
         object_size: 1024 * 1024,
@@ -358,8 +396,18 @@ async fn perf_file_medium_objects_sequential() {
 #[tokio::test]
 #[ignore]
 async fn perf_file_large_objects_sequential() {
+    let cfg = load_perf_config();
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(FileStorage::new(temp_dir.path()).await.unwrap());
+    let storage = Arc::new(
+        FileStorage::new_multi_drive(
+            vec![temp_dir.path().to_path_buf()],
+            cfg.storage.erasure.data_blocks,
+            cfg.storage.erasure.parity_blocks,
+            cfg.storage.erasure.block_size,
+        )
+        .await
+        .unwrap()
+    );
     let config = PerfConfig {
         name: "FileStorage - Large Objects (10MB) - Sequential",
         object_size: 10 * 1024 * 1024,
@@ -377,8 +425,18 @@ async fn perf_file_large_objects_sequential() {
 #[tokio::test]
 #[ignore]
 async fn perf_file_concurrent_puts() {
+    let cfg = load_perf_config();
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(FileStorage::new(temp_dir.path()).await.unwrap());
+    let storage = Arc::new(
+        FileStorage::new_multi_drive(
+            vec![temp_dir.path().to_path_buf()],
+            cfg.storage.erasure.data_blocks,
+            cfg.storage.erasure.parity_blocks,
+            cfg.storage.erasure.block_size,
+        )
+        .await
+        .unwrap()
+    );
     let config = PerfConfig {
         name: "FileStorage - Medium Objects (1MB) - Concurrent PUT (10 tasks)",
         object_size: 1024 * 1024,
@@ -393,8 +451,18 @@ async fn perf_file_concurrent_puts() {
 #[tokio::test]
 #[ignore]
 async fn perf_file_concurrent_gets() {
+    let cfg = load_perf_config();
     let temp_dir = TempDir::new().unwrap();
-    let storage = Arc::new(FileStorage::new(temp_dir.path()).await.unwrap());
+    let storage = Arc::new(
+        FileStorage::new_multi_drive(
+            vec![temp_dir.path().to_path_buf()],
+            cfg.storage.erasure.data_blocks,
+            cfg.storage.erasure.parity_blocks,
+            cfg.storage.erasure.block_size,
+        )
+        .await
+        .unwrap()
+    );
     let config = PerfConfig {
         name: "FileStorage - Medium Objects (1MB) - Concurrent GET (10 tasks)",
         object_size: 1024 * 1024,
@@ -413,6 +481,16 @@ async fn perf_comparison_storage_backends() {
     println!("STORAGE BACKEND COMPARISON");
     println!("{}", "=".repeat(80));
 
+    // Load configuration from TOML file
+    let cfg = load_perf_config();
+
+    println!("\nErasure Coding Configuration:");
+    println!("  Data blocks:   {}", cfg.storage.erasure.data_blocks);
+    println!("  Parity blocks: {}", cfg.storage.erasure.parity_blocks);
+    println!("  Block size:    {} bytes ({} MB)",
+        cfg.storage.erasure.block_size,
+        cfg.storage.erasure.block_size / (1024 * 1024));
+
     let config = PerfConfig {
         name: "Comparison Test",
         object_size: 1024 * 1024, // 1MB
@@ -425,9 +503,18 @@ async fn perf_comparison_storage_backends() {
     let inmem_put = benchmark_put_operations(inmem_storage.clone(), &config).await;
     let inmem_get = benchmark_get_operations(inmem_storage, &config).await;
 
-    // FileStorage
+    // FileStorage with config-based erasure coding
     let temp_dir = TempDir::new().unwrap();
-    let file_storage = Arc::new(FileStorage::new(temp_dir.path()).await.unwrap());
+    let file_storage = Arc::new(
+        FileStorage::new_multi_drive(
+            vec![temp_dir.path().to_path_buf()],
+            cfg.storage.erasure.data_blocks,
+            cfg.storage.erasure.parity_blocks,
+            cfg.storage.erasure.block_size,
+        )
+        .await
+        .unwrap()
+    );
     let file_put = benchmark_put_operations(file_storage.clone(), &config).await;
     let file_get = benchmark_get_operations(file_storage, &config).await;
 

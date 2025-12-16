@@ -49,11 +49,18 @@ pub struct FileStorage {
 }
 
 impl FileStorage {
+    /// Create FileStorage with single drive and default erasure coding (4 data, 1 parity, 1MB blocks)
     pub async fn new<P: AsRef<Path>>(root: P) -> Result<Self, StorageError> {
-        Self::new_multi_drive(vec![root.as_ref().to_path_buf()]).await
+        Self::new_multi_drive(vec![root.as_ref().to_path_buf()], 4, 1, 1024 * 1024).await
     }
 
-    pub async fn new_multi_drive(drives: Vec<PathBuf>) -> Result<Self, StorageError> {
+    /// Create FileStorage with multiple drives and custom erasure coding parameters
+    pub async fn new_multi_drive(
+        drives: Vec<PathBuf>,
+        data_blocks: usize,
+        parity_blocks: usize,
+        block_size: usize,
+    ) -> Result<Self, StorageError> {
         if drives.is_empty() {
             return Err(StorageError::InvalidInput(
                 "At least one drive path required".to_string(),
@@ -69,7 +76,7 @@ impl FileStorage {
 
         Ok(Self {
             drives,
-            erasure: Erasure::new(4, 1, 1024 * 1024)?,
+            erasure: Erasure::new(data_blocks, parity_blocks, block_size)?,
         })
     }
 

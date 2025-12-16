@@ -34,6 +34,32 @@ pub struct StorageConfig {
     /// multiple drive paths for file backend (spreads shards across drives)
     #[serde(default)]
     pub drives: Vec<String>,
+    /// erasure coding configuration
+    #[serde(default)]
+    pub erasure: ErasureConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ErasureConfig {
+    /// Number of data blocks (shards) per object
+    #[serde(default = "default_data_blocks")]
+    pub data_blocks: usize,
+    /// Number of parity blocks for redundancy/recovery
+    #[serde(default = "default_parity_blocks")]
+    pub parity_blocks: usize,
+    /// Block size in bytes (size of each shard)
+    #[serde(default = "default_block_size")]
+    pub block_size: usize,
+}
+
+impl Default for ErasureConfig {
+    fn default() -> Self {
+        Self {
+            data_blocks: default_data_blocks(),
+            parity_blocks: default_parity_blocks(),
+            block_size: default_block_size(),
+        }
+    }
 }
 
 impl Default for StorageConfig {
@@ -42,6 +68,7 @@ impl Default for StorageConfig {
             backend: default_backend(),
             path: default_path(),
             drives: Vec::new(),
+            erasure: ErasureConfig::default(),
         }
     }
 }
@@ -116,4 +143,16 @@ fn default_lifecycle_interval() -> u64 {
 
 fn default_max_concurrent_deletes() -> usize {
     100
+}
+
+fn default_data_blocks() -> usize {
+    4
+}
+
+fn default_parity_blocks() -> usize {
+    1
+}
+
+fn default_block_size() -> usize {
+    1024 * 1024 // 1 MB
 }

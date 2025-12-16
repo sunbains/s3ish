@@ -56,8 +56,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(|s| s.into())
                 .collect();
-            let fs = FileStorage::new_multi_drive(drives).await?;
-            tracing::info!(num_drives = fs.num_drives(), "FileStorage initialized with {} drives", fs.num_drives());
+            let fs = FileStorage::new_multi_drive(
+                drives,
+                cfg.storage.erasure.data_blocks,
+                cfg.storage.erasure.parity_blocks,
+                cfg.storage.erasure.block_size,
+            ).await?;
+            tracing::info!(
+                num_drives = fs.num_drives(),
+                data_blocks = cfg.storage.erasure.data_blocks,
+                parity_blocks = cfg.storage.erasure.parity_blocks,
+                block_size = cfg.storage.erasure.block_size,
+                "FileStorage initialized"
+            );
             Arc::new(fs)
         }
         _ => Arc::new(InMemoryStorage::new()),

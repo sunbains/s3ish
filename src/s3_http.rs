@@ -83,6 +83,70 @@ fn global_response_context() -> &'static ResponseContext {
     GLOBAL_RESPONSE_CONTEXT.get_or_init(ResponseContext::default)
 }
 
+/// Extract bucket name from Host header for virtual-hosted style URLs.
+///
+/// Virtual-hosted style: `bucket.s3.amazonaws.com` or `bucket.s3.region.amazonaws.com`
+/// Also supports: `bucket.localhost`, `bucket.127.0.0.1`, `bucket.custom-domain.com`
+///
+/// Returns None if:
+/// - Host is missing
+/// - Host is an IP address without subdomain
+/// - Host is "localhost" without subdomain
+/// - Host doesn't match expected patterns
+fn extract_bucket_from_host(host: &str) -> Option<String> {
+    // Skip if host is just an IP address or localhost
+    if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" {
+        return None;
+    }
+
+    // Split host by dots
+    let parts: Vec<&str> = host.split('.').collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    // If host has a port, remove it from the last part
+    let last_part = parts.last().unwrap();
+    let host_without_port = if last_part.contains(':') {
+        // Reconstruct without port
+        let mut new_parts = parts.clone();
+        let last = new_parts.last_mut().unwrap();
+        *last = last.split(':').next().unwrap();
+        new_parts
+    } else {
+        parts.clone()
+    };
+
+    // Pattern matching for various virtual-hosted styles:
+    // - bucket.s3.amazonaws.com
+    // - bucket.s3.region.amazonaws.com
+    // - bucket.s3-region.amazonaws.com
+    // - bucket.localhost
+    // - bucket.custom-domain.com
+
+    // If there's only one part before the port removal, no bucket
+    if host_without_port.len() < 2 {
+        return None;
+    }
+
+    // Check for S3-style patterns
+    if host_without_port.len() >= 3 {
+        // Check if it's s3.amazonaws.com or s3.region.amazonaws.com pattern
+        if (host_without_port[1] == "s3" || host_without_port[1].starts_with("s3-"))
+            && (host_without_port.last() == Some(&"com")
+                || host_without_port.last() == Some(&"amazonaws"))
+        {
+            // First part is the bucket
+            return Some(host_without_port[0].to_string());
+        }
+    }
+
+    // For localhost or custom domains: bucket.domain.tld
+    // First part is the bucket
+    Some(host_without_port[0].to_string())
+}
+
 impl S3State {
     async fn storage_buckets(&self) -> Result<Vec<BucketEntry>, S3Error> {
         let buckets = self.handler.storage.list_buckets().await?;
@@ -1854,10 +1918,10 @@ async fn post_object(
     ))
 }
 
-/// GET /{bucket}/{key} - Get object
+/// GET /{bucket}/{key} - Get object (supports both path-style and virtual-hosted style)
 async fn get_object(
     State(state): State<S3State>,
-    Path((bucket, key)): Path<(String, String)>,
+    Path((path_bucket, path_key)): Path<(String, String)>,
     Query(params): Query<ObjectVersionParams>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
@@ -1868,6 +1932,21 @@ async fn get_object(
     s3_handler
         .authenticate(&Method::GET, &uri, &headers, &[])
         .await?;
+
+    // Check for virtual-hosted style: if Host header contains a bucket subdomain,
+    // use it instead of the path bucket, and treat path_bucket as part of the key
+    let (bucket, key) = if let Some(host_bucket) = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(extract_bucket_from_host)
+    {
+        // Virtual-hosted style: bucket from host, entire path (including path_bucket) is the key
+        let full_key = format!("{}/{}", path_bucket, path_key);
+        (host_bucket, full_key)
+    } else {
+        // Path-style: use bucket and key from path as normal
+        (path_bucket, path_key)
+    };
 
     let (data, meta) = if let Some(version_id) = params.version_id {
         state.handler.storage.get_object_version(&bucket, &key, &version_id).await?
@@ -2210,6 +2289,44 @@ async fn list_objects(
     s3_handler
         .authenticate(&Method::GET, &uri, &headers, &[])
         .await?;
+
+    // Check for virtual-hosted style: if Host contains bucket subdomain,
+    // treat the path (bucket parameter) as an object key
+    if let Some(host_bucket) = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .and_then(extract_bucket_from_host)
+    {
+        // Virtual-hosted style detected
+        // If bucket parameter is not empty, it's actually the object key
+        if !bucket.is_empty() {
+            // This is a GET object request, not list objects
+            // Get the object
+            let (data, meta) = state.handler.storage.get_object(&host_bucket, &bucket).await?;
+
+            // Return object data with headers (same logic as get_object)
+            let mut resp: Response = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, meta.content_type.clone()),
+                    (header::ETAG, format!("\"{}\"", meta.etag)),
+                    (header::CONTENT_LENGTH, meta.size.to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (
+                        header::LAST_MODIFIED,
+                        format_http_date(meta.last_modified_unix_secs),
+                    ),
+                ],
+                Body::from(data),
+            )
+                .into_response();
+            apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+            apply_storage_headers(resp.headers_mut(), &meta);
+            return Ok(attach_common_headers(resp, &state));
+        }
+        // If bucket parameter is empty, proceed with list operation using host_bucket
+        // (though this is unusual - empty path with virtual-hosted style)
+    }
 
     // Check if this is a GET versioning status request
     if params.versioning.is_some() {
@@ -4366,5 +4483,170 @@ mod tests {
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("ListVersionsResult"));
         assert!(body_str.contains("<IsLatest>true</IsLatest>"));
+    }
+
+    #[tokio::test]
+    async fn test_virtual_hosted_style_get_object() {
+        let handler = create_test_handler(false);
+        let app = handler.clone().router();
+
+        // Create bucket first (path-style)
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/my-bucket")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Put object (path-style)
+        let app2 = handler.clone().router();
+        app2.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/my-bucket/my-key.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("virtual hosted test data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Get object using virtual-hosted style
+        let app3 = handler.router();
+        let response = app3
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/my-key.txt")  // Key only in path
+                    .header("host", "my-bucket.s3.amazonaws.com")  // Bucket in host
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"virtual hosted test data");
+    }
+
+    #[tokio::test]
+    async fn test_virtual_hosted_style_localhost() {
+        let handler = create_test_handler(false);
+        let app = handler.clone().router();
+
+        // Create bucket
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Put object
+        let app2 = handler.clone().router();
+        app2.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/test-bucket/data.json")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"test":"localhost"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Get object using virtual-hosted style with localhost
+        let app3 = handler.router();
+        let response = app3
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/data.json")
+                    .header("host", "test-bucket.localhost:3000")  // Bucket subdomain with port
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], br#"{"test":"localhost"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_virtual_hosted_style_nested_key() {
+        let handler = create_test_handler(false);
+        let app = handler.clone().router();
+
+        // Create bucket
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/nested-bucket")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Put object with nested key
+        let app2 = handler.clone().router();
+        app2.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/nested-bucket/path/to/file.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("nested content"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Get object using virtual-hosted style with nested path
+        let app3 = handler.router();
+        let response = app3
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/path/to/file.txt")  // Nested path as key
+                    .header("host", "nested-bucket.s3.us-east-1.amazonaws.com")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"nested content");
     }
 }

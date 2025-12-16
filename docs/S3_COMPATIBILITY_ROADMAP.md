@@ -20,6 +20,7 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 - **Encryption Headers** - x-amz-server-side-encryption request/response support
 - **Content-MD5 Validation** - Integrity checking for uploads
 - **Object Versioning** - Full S3-compatible versioning with version IDs, delete markers, and version listing
+- **Virtual-Hosted Style URLs** - Full support for both path-style and virtual-hosted style
 
 ### 🚧 Partial / In Progress
 - None currently
@@ -27,7 +28,6 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 ### ❌ Not Yet Implemented
 - **Bucket Policies & ACLs** - Not implemented
 - **Server-Side Encryption** - Not implemented (headers accepted but not encrypted)
-- **Virtual-Hosted Style URLs** - Only path-style supported
 - **Lifecycle Policies** - Not implemented
 
 ## Phase 1: Core S3 API ✅ MOSTLY COMPLETED
@@ -74,11 +74,11 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 **Impact:** S3 clients can parse all responses correctly
 
 ### 1.3 S3-Compatible Endpoints ✅ COMPLETED
-**Status:** ✅ Fully implemented (path-style)
-**Details:** Complete S3 endpoint coverage with query parameter routing
+**Status:** ✅ Fully implemented (both path-style and virtual-hosted style)
+**Details:** Complete S3 endpoint coverage with query parameter routing and dual URL style support
 
 ```rust
-// Implemented (Path-style):
+// Implemented (Path-style and Virtual-hosted style):
 - [x] GET    /{bucket}/{key}           // GetObject
 - [x] PUT    /{bucket}/{key}           // PutObject
 - [x] DELETE /{bucket}/{key}           // DeleteObject
@@ -96,11 +96,17 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 - [x] POST   /{bucket}/{key}?uploadId=X                // CompleteMultipartUpload
 - [x] DELETE /{bucket}/{key}?uploadId=X                // AbortMultipartUpload
 - [x] POST   /{bucket}/?delete                         // DeleteObjects (multi-delete)
+
+// Virtual-hosted style (bucket in Host header):
+- [x] Host: bucket.s3.amazonaws.com         // Standard S3 format
+- [x] Host: bucket.s3.region.amazonaws.com  // Regional format
+- [x] Host: bucket.s3-region.amazonaws.com  // Alternative regional format
+- [x] Host: bucket.localhost:9000           // Local testing
+- [x] Host: bucket.custom-domain.com        // Custom domains
 ```
 
-**Implementation:** See `src/s3_http.rs` - Full Axum router with query parameter handling
-**Impact:** AWS CLI/SDKs work correctly
-**Note:** Virtual-hosted-style not yet implemented (not critical for single-host deployment)
+**Implementation:** See `src/s3_http.rs` - Full Axum router with query parameter handling and `extract_bucket_from_host()` helper
+**Impact:** AWS CLI/SDKs work correctly with both URL styles
 
 ### 1.4 S3 Headers Support ✅ COMPLETED
 **Status:** ✅ Comprehensive header support implemented

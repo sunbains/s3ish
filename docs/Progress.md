@@ -136,3 +136,19 @@
   - **Benefits**: Shared versioning logic, easier to add new storage backends, improved testability, cleaner separation of concerns
   - **Test Results**: All 121 tests passing (no regressions)
   - **Implementation Status**: Versioning module fully functional, both InMemoryStorage and FileStorage using shared abstraction
+- 2025-12-16: Implemented Virtual-Hosted Style URLs:
+  - **HTTP Handler (src/s3_http.rs)**:
+    - Added `extract_bucket_from_host()` helper function to parse bucket names from Host header
+    - Supports multiple host patterns: `bucket.s3.amazonaws.com`, `bucket.s3.region.amazonaws.com`, `bucket.s3-region.amazonaws.com`, `bucket.localhost:9000`, `bucket.custom-domain.com`
+    - Modified `get_object()` handler to detect virtual-hosted style and reassemble bucket/key accordingly
+    - Modified `list_objects()` handler to route virtual-hosted single-segment paths to object GET operations
+    - Both path-style and virtual-hosted style work interchangeably without breaking changes
+  - **Tests**:
+    - Added 3 comprehensive tests covering virtual-hosted style: standard format, localhost with port, nested key paths
+    - All tests pass (124 total: 121 original + 3 virtual-hosted)
+  - **Documentation**:
+    - Updated README.md Features section to include virtual-hosted style support
+    - Updated S3_COMPATIBILITY_ROADMAP.md to mark virtual-hosted style as completed
+    - Updated API_USAGE.md with new "URL Styles" section including examples for both path-style and virtual-hosted style
+  - **Test Results**: All 124 tests passing
+  - **Implementation Status**: Virtual-hosted style fully functional, backward compatible with path-style URLs

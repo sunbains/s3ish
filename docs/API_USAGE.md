@@ -1,6 +1,6 @@
 ## Overview
 
-This project exposes S3-style HTTP endpoints (path-style) and a gRPC service. It supports SigV4 and header-based auth, XML responses, multipart uploads, range requests, and CopyObject. Storage backends include in-memory and filesystem (selectable via `config.toml`).
+This project exposes S3-style HTTP endpoints (both path-style and virtual-hosted style) and a gRPC service. It supports SigV4 and header-based auth, XML responses, multipart uploads, range requests, and CopyObject. Storage backends include in-memory and filesystem (selectable via `config.toml`).
 
 ## Authentication
 
@@ -10,7 +10,57 @@ This project exposes S3-style HTTP endpoints (path-style) and a gRPC service. It
 Requests without valid credentials return:
 - HTTP 403 with XML `<Code>AccessDenied</Code>`
 
-## HTTP Endpoints (path-style)
+## URL Styles
+
+s3ish supports both S3 URL styles:
+
+### Path-Style URLs
+Bucket name appears in the URL path:
+```
+http://localhost:9000/{bucket}/{key}
+```
+
+**Example:**
+```bash
+curl http://localhost:9000/my-bucket/my-key.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+```
+
+### Virtual-Hosted Style URLs
+Bucket name appears in the Host header as a subdomain:
+```
+http://{bucket}.localhost:9000/{key}
+http://{bucket}.s3.amazonaws.com/{key}
+http://{bucket}.s3.{region}.amazonaws.com/{key}
+http://{bucket}.custom-domain.com/{key}
+```
+
+**Supported Host Patterns:**
+- `bucket.s3.amazonaws.com` — Standard S3 format
+- `bucket.s3.region.amazonaws.com` — Regional format
+- `bucket.s3-region.amazonaws.com` — Alternative regional format
+- `bucket.localhost:9000` — Local testing
+- `bucket.custom-domain.com` — Custom domains
+
+**Examples:**
+```bash
+# Virtual-hosted style with localhost
+curl http://my-bucket.localhost:9000/my-key.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+
+# Virtual-hosted style with S3 domain
+curl http://my-bucket.s3.amazonaws.com/my-key.txt \
+  -H "Host: my-bucket.s3.amazonaws.com" \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+
+# Nested key paths work in virtual-hosted style
+curl http://my-bucket.localhost:9000/path/to/file.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+```
+
+**Note:** Both styles work interchangeably. The server automatically detects virtual-hosted style by parsing the Host header and treats the URL path as the object key instead of `{bucket}/{key}`.
+
+## HTTP Endpoints
 
 - `PUT /{bucket}` — Create bucket  
   - Errors: `BucketAlreadyExists` (409), `InvalidLocationConstraint` (400)

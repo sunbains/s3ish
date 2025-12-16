@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::fs::remove_dir_all;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter, BufReader};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMeta {
@@ -200,12 +200,14 @@ impl FileStorage {
     async fn read_shards_from_dir(&self, shard_dir: &Path, db: usize, pb: usize, size: u64) -> Result<Vec<u8>, StorageError> {
         let total = db + pb.max(1);
         let mut readers = Vec::new();
+
+        // Open all shard files with buffered readers for better performance
         for idx in 0..total {
-            let shard_path = shard_dir.join(format!("{idx}"));
+            let shard_path = shard_dir.join(format!("{}", idx));
             match fs::File::open(&shard_path).await {
-                Ok(f) => readers.push(Some(f)),
+                Ok(f) => readers.push(Some(BufReader::with_capacity(65536, f))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => readers.push(None),
-                Err(e) => return Err(StorageError::Internal(format!("open shard {idx}: {e}"))),
+                Err(e) => return Err(StorageError::Internal(format!("open shard {}: {}", idx, e))),
             }
         }
         // streaming decode
@@ -691,11 +693,11 @@ impl StorageBackend for FileStorage {
         let mut files = Vec::new();
         for idx in 0..shard_count {
             let tmp_shard = shard_dir.join(format!("{idx}.tmp"));
-            files.push(
-                fs::File::create(&tmp_shard)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("create shard: {e}")))?,
-            );
+            let file = fs::File::create(&tmp_shard)
+                .await
+                .map_err(|e| StorageError::Internal(format!("create shard: {e}")))?;
+            // Use BufWriter with 64KB buffer for better I/O performance
+            files.push(BufWriter::with_capacity(65536, file));
         }
 
         for stripe_start in
@@ -732,16 +734,30 @@ impl StorageBackend for FileStorage {
             }
         }
 
-        // flush and rename
+        // Flush and rename shards in parallel for better performance
+        let mut handles = Vec::new();
         for (idx, mut f) in files.into_iter().enumerate() {
-            f.flush()
+            let shard_dir = shard_dir.to_path_buf();
+            let handle = tokio::spawn(async move {
+                f.flush()
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("flush shard {}: {}", idx, e)))?;
+                drop(f); // Close file before rename
+                let tmp = shard_dir.join(format!("{}.tmp", idx));
+                let final_path = shard_dir.join(format!("{}", idx));
+                fs::rename(tmp, final_path)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("commit shard {}: {}", idx, e)))?;
+                Ok::<(), StorageError>(())
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            handle
                 .await
-                .map_err(|e| StorageError::Internal(format!("flush shard: {e}")))?;
-            let tmp = shard_dir.join(format!("{idx}.tmp"));
-            let final_path = shard_dir.join(format!("{idx}"));
-            fs::rename(tmp, final_path)
-                .await
-                .map_err(|e| StorageError::Internal(format!("commit shard: {e}")))?;
+                .map_err(|e| StorageError::Internal(format!("flush task failed: {}", e)))??;
         }
 
         let size = data.len() as u64;
@@ -761,11 +777,23 @@ impl StorageBackend for FileStorage {
             is_latest: true,
             is_delete_marker: false,
         };
+
+        // Write metadata concurrently with the last shard operations for better performance
         let meta_bytes =
             serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
-        fs::write(&meta_path, meta_bytes)
+        let meta_write = tokio::spawn({
+            let meta_path = meta_path.clone();
+            async move {
+                fs::write(&meta_path, meta_bytes)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("write meta: {}", e)))
+            }
+        });
+
+        // Wait for metadata write to complete
+        meta_write
             .await
-            .map_err(|e| StorageError::Internal(format!("write meta: {e}")))?;
+            .map_err(|e| StorageError::Internal(format!("metadata write task failed: {}", e)))??;
 
         // Record overall operation metrics
         let duration = start_time.elapsed().as_secs_f64();

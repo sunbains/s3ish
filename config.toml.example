@@ -3,3 +3,9 @@ listen_addr = "127.0.0.1:50051"
 auth_file = "./creds.txt"
 region = "us-east-1"
 request_id_prefix = "req-"
+
+[storage]
+# backend can be "in-memory" or "file"
+backend = "in-memory"
+# path is used when backend = "file"
+path = "./data"

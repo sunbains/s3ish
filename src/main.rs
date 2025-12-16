@@ -5,6 +5,7 @@ use s3ish::config::Config;
 use s3ish::handler::BaseHandler;
 use s3ish::s3_http::ResponseContext;
 use s3ish::server::{ConnectionManager, GrpcConnectionManager, S3HttpConnectionManager};
+use s3ish::storage::file_storage::FileStorage;
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
 use std::net::SocketAddr;
@@ -49,7 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared components
     let auth_file = args.auth_file.as_ref().unwrap_or(&cfg.auth_file);
     let auth: Arc<dyn Authenticator> = Arc::new(FileAuthenticator::new(auth_file).await?);
-    let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let storage: Arc<dyn StorageBackend> = match cfg.storage.backend.as_str() {
+        "file" => {
+            let fs = FileStorage::new(&cfg.storage.path).await?;
+            Arc::new(fs)
+        }
+        _ => Arc::new(InMemoryStorage::new()),
+    };
     let handler = BaseHandler::new(auth, storage);
     let response_ctx = ResponseContext::new(cfg.region.clone(), cfg.request_id_prefix.clone());
 

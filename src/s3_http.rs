@@ -271,6 +271,7 @@ impl S3HttpHandler {
                 get(list_objects)
                     .put(create_bucket)
                     .delete(delete_bucket)
+                    .post(delete_objects)
                     .head(head_bucket),
             )
             .route("/:bucket/", get(list_objects))
@@ -447,6 +448,11 @@ struct MultipartUpload {
 struct MultipartPart {
     etag: String,
     data: Bytes,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteQuery {
+    delete: Option<String>,
 }
 
 pub trait ResponseRenderer: Send + Sync {
@@ -751,6 +757,33 @@ fn parse_complete_multipart_body(body: &[u8]) -> Result<Vec<(u32, String)>, S3Er
         ));
     }
     Ok(out)
+}
+
+fn parse_multi_delete_body(body: &[u8]) -> Result<(Vec<String>, bool), S3Error> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| S3Error::InvalidInput("Invalid XML encoding".to_string()))?;
+    let quiet = text.to_lowercase().contains("<quiet>true</quiet>");
+
+    let mut keys = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = text[start..].find("<Key>") {
+        let key_start = start + idx + "<Key>".len();
+        if let Some(end_rel) = text[key_start..].find("</Key>") {
+            let end = key_start + end_rel;
+            keys.push(text[key_start..end].to_string());
+            start = end + "</Key>".len();
+        } else {
+            break;
+        }
+    }
+
+    if keys.is_empty() {
+        return Err(S3Error::InvalidInput(
+            "No keys provided for multi-delete".to_string(),
+        ));
+    }
+
+    Ok((keys, quiet))
 }
 
 fn parse_copy_source(raw: &str) -> Option<(String, String)> {
@@ -1240,10 +1273,7 @@ async fn copy_object_internal(
         Err(e) => return Err(e.into()),
     };
 
-    if let Some(expect) = headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(expect) = headers.get(header::IF_MATCH).and_then(|v| v.to_str().ok()) {
         match dest_meta.as_ref() {
             Some(existing) if normalize_etag(expect) == normalize_etag(&existing.etag) => {}
             _ => {
@@ -1396,7 +1426,10 @@ async fn get_object(
                 StatusCode::NOT_MODIFIED,
                 [
                     (header::ETAG, format!("\"{}\"", meta.etag)),
-                    (header::LAST_MODIFIED, format_http_date(meta.last_modified_unix_secs)),
+                    (
+                        header::LAST_MODIFIED,
+                        format_http_date(meta.last_modified_unix_secs),
+                    ),
                 ],
                 Body::empty(),
             )
@@ -1455,6 +1488,80 @@ async fn get_object(
     )
         .into_response();
     apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+    Ok(attach_common_headers(resp, &state))
+}
+
+/// POST /{bucket}?delete - Delete multiple objects
+async fn delete_objects(
+    State(state): State<S3State>,
+    Path(bucket): Path<String>,
+    Query(query): Query<DeleteQuery>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, S3Error> {
+    let s3_handler = S3HttpHandler {
+        state: state.clone(),
+    };
+    s3_handler
+        .authenticate(&Method::POST, &uri, &headers, &body)
+        .await?;
+
+    if query.delete.is_none() {
+        return Err(S3Error::InvalidInput(
+            "The delete query parameter is required".to_string(),
+        ));
+    }
+
+    if !state.bucket_exists(&bucket).await? {
+        return Err(S3Error::BucketNotFound(bucket.clone()));
+    }
+
+    let (keys, quiet) = parse_multi_delete_body(&body)?;
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+
+    for key in keys {
+        match state.handler.storage.delete_object(&bucket, &key).await {
+            Ok(_) => {
+                if !quiet {
+                    deleted.push(key);
+                }
+            }
+            Err(StorageError::ObjectNotFound { .. }) => {
+                if !quiet {
+                    deleted.push(key);
+                }
+            }
+            Err(e) => {
+                errors.push((key, e));
+            }
+        }
+    }
+
+    let mut body = String::new();
+    body.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    body.push_str(&format!(r#"<DeleteResult xmlns="{}">"#, XMLNS));
+    for key in deleted {
+        body.push_str("<Deleted>");
+        body.push_str(&format!("<Key>{}</Key>", key));
+        body.push_str("</Deleted>");
+    }
+    for (key, err) in errors {
+        body.push_str("<Error>");
+        body.push_str(&format!("<Key>{}</Key>", key));
+        body.push_str("<Code>InternalError</Code>");
+        body.push_str(&format!("<Message>{}</Message>", err));
+        body.push_str("</Error>");
+    }
+    body.push_str("</DeleteResult>");
+
+    let resp: Response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        body,
+    )
+        .into_response();
     Ok(attach_common_headers(resp, &state))
 }
 
@@ -1589,7 +1696,12 @@ struct CopyHeaders {
 }
 
 fn copy_headers_from_map(headers: &HeaderMap) -> CopyHeaders {
-    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
     CopyHeaders {
         copy_source: get("x-amz-copy-source"),
         copy_source_if_match: get("x-amz-copy-source-if-match"),
@@ -2257,14 +2369,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            get_resp.headers().get("x-amz-meta-color").unwrap(),
-            "blue"
-        );
-        assert_eq!(
-            get_resp.headers().get("x-amz-meta-flag").unwrap(),
-            "yes"
-        );
+        assert_eq!(get_resp.headers().get("x-amz-meta-color").unwrap(), "blue");
+        assert_eq!(get_resp.headers().get("x-amz-meta-flag").unwrap(), "yes");
 
         // HEAD should also include metadata
         let head_resp = app
@@ -2279,14 +2385,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            head_resp.headers().get("x-amz-meta-color").unwrap(),
-            "blue"
-        );
-        assert_eq!(
-            head_resp.headers().get("x-amz-meta-flag").unwrap(),
-            "yes"
-        );
+        assert_eq!(head_resp.headers().get("x-amz-meta-color").unwrap(), "blue");
+        assert_eq!(head_resp.headers().get("x-amz-meta-flag").unwrap(), "yes");
     }
 
     #[tokio::test]
@@ -2471,10 +2571,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            get_resp.headers().get("x-amz-meta-src").unwrap(),
-            "keep"
-        );
+        assert_eq!(get_resp.headers().get("x-amz-meta-src").unwrap(), "keep");
 
         // REPLACE should use new metadata only
         let replace_resp = app
@@ -2507,10 +2604,7 @@ mod tests {
             .await
             .unwrap();
         assert!(get_replace.headers().get("x-amz-meta-src").is_none());
-        assert_eq!(
-            get_replace.headers().get("x-amz-meta-new").unwrap(),
-            "yes"
-        );
+        assert_eq!(get_replace.headers().get("x-amz-meta-new").unwrap(), "yes");
     }
 
     #[tokio::test]
@@ -3343,5 +3437,141 @@ mod tests {
             .to_bytes();
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("<Code>InvalidPart</Code>"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_delete_objects() {
+        let handler = create_test_handler(false);
+        let app = handler.clone().router();
+
+        // Create bucket and seed objects
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mdel")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for key in ["a.txt", "b.txt"] {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/mdel/{}", key))
+                        .header("x-access-key", "test-user")
+                        .header("x-secret-key", "test-pass")
+                        .body(Body::from("payload"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let delete_body = r#"<Delete><Object><Key>a.txt</Key></Object><Object><Key>b.txt</Key></Object></Delete>"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mdel?delete")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::from(delete_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("<Deleted><Key>a.txt</Key></Deleted>"));
+        assert!(body_str.contains("<Deleted><Key>b.txt</Key></Deleted>"));
+
+        // Objects should be gone
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mdel/a.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_multi_delete_quiet() {
+        let handler = create_test_handler(false);
+        let app = handler.clone().router();
+
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mdel-quiet")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mdel-quiet/file.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let delete_body =
+            r#"<Delete><Quiet>true</Quiet><Object><Key>file.txt</Key></Object></Delete>"#;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mdel-quiet?delete")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::from(delete_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(!body_str.contains("<Deleted>"));
+
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mdel-quiet/file.txt")
+                    .header("x-access-key", "test-user")
+                    .header("x-secret-key", "test-pass")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
     }
 }

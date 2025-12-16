@@ -1,3 +1,4 @@
+use crate::storage::common::{compute_etag, validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
 use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
 use async_trait::async_trait;
@@ -44,22 +45,6 @@ impl Default for InMemoryStorage {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn validate_bucket(bucket: &str) -> Result<(), StorageError> {
-    if bucket.is_empty() {
-        return Err(StorageError::InvalidInput(
-            "bucket must be non-empty".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_key(key: &str) -> Result<(), StorageError> {
-    if key.is_empty() {
-        return Err(StorageError::InvalidInput("key must be non-empty".into()));
-    }
-    Ok(())
 }
 
 #[async_trait]
@@ -113,7 +98,7 @@ impl StorageBackend for InMemoryStorage {
         }
 
         let size = data.len() as u64;
-        let etag = format!("{:x}", md5::compute(&data));
+        let etag = compute_etag(&data);
         let (shards, orig_len) = self.erasure.encode(&data)?;
         let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
 
@@ -145,13 +130,14 @@ impl StorageBackend for InMemoryStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let objs = self.objects.read().await;
-        let obj = objs.get(&(bucket.to_string(), key.to_string())).ok_or_else(|| {
-            StorageError::ObjectNotFound {
+        let obj = objs
+            .get(&(bucket.to_string(), key.to_string()))
+            .ok_or_else(|| StorageError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-            }
-        })?;
-        let mut shards: Vec<Option<Vec<u8>>> = obj.shards.iter().map(|c| Some(c.to_vec())).collect();
+            })?;
+        let mut shards: Vec<Option<Vec<u8>>> =
+            obj.shards.iter().map(|c| Some(c.to_vec())).collect();
         let data = self.erasure.decode(&mut shards, obj.orig_len)?;
         Ok((Bytes::from(data), obj.meta.clone()))
     }
@@ -166,12 +152,12 @@ impl StorageBackend for InMemoryStorage {
             }
         }
         let objs = self.objects.read().await;
-        let obj = objs.get(&(bucket.to_string(), key.to_string())).ok_or_else(|| {
-            StorageError::ObjectNotFound {
+        let obj = objs
+            .get(&(bucket.to_string(), key.to_string()))
+            .ok_or_else(|| StorageError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-            }
-        })?;
+            })?;
         Ok(obj.meta.clone())
     }
 
@@ -387,13 +373,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         let result = storage
-            .put_object(
-                "bucket1",
-                "key1",
-                Bytes::from("data"),
-                "",
-                HashMap::new(),
-            )
+            .put_object("bucket1", "key1", Bytes::from("data"), "", HashMap::new())
             .await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }

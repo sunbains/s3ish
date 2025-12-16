@@ -4,13 +4,17 @@ use crate::storage::StorageError;
 /// Supports reconstruction of a single missing shard when parity is present.
 #[derive(Debug, Clone)]
 pub struct Erasure {
-    data_blocks: usize,
-    parity_blocks: usize,
-    block_size: usize,
+    pub data_blocks: usize,
+    pub parity_blocks: usize,
+    pub block_size: usize,
 }
 
 impl Erasure {
-    pub fn new(data_blocks: usize, parity_blocks: usize, block_size: usize) -> Result<Self, StorageError> {
+    pub fn new(
+        data_blocks: usize,
+        parity_blocks: usize,
+        block_size: usize,
+    ) -> Result<Self, StorageError> {
         if data_blocks == 0 {
             return Err(StorageError::InvalidInput("data_blocks must be > 0".into()));
         }
@@ -25,15 +29,15 @@ impl Erasure {
         if data.is_empty() {
             return Err(StorageError::InvalidInput("data cannot be empty".into()));
         }
-        let shard_len = ((data.len() + self.data_blocks - 1) / self.data_blocks).max(1);
+        let shard_len = data.len().div_ceil(self.data_blocks).max(1);
         let total_shards = self.data_blocks + self.parity_blocks.max(1);
         let mut shards = vec![vec![0u8; shard_len]; total_shards];
 
-        for i in 0..self.data_blocks {
+        for (i, shard) in shards.iter_mut().enumerate().take(self.data_blocks) {
             let start = i * shard_len;
             if start < data.len() {
                 let end = std::cmp::min(start + shard_len, data.len());
-                shards[i][..end - start].copy_from_slice(&data[start..end]);
+                shard[..end - start].copy_from_slice(&data[start..end]);
             }
         }
 
@@ -50,7 +54,11 @@ impl Erasure {
         Ok((shards, data.len()))
     }
 
-    pub fn decode(&self, shards: &mut [Option<Vec<u8>>], orig_len: usize) -> Result<Vec<u8>, StorageError> {
+    pub fn decode(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        orig_len: usize,
+    ) -> Result<Vec<u8>, StorageError> {
         if shards.len() < self.data_blocks + 1 {
             return Err(StorageError::InvalidInput("not enough shards".into()));
         }
@@ -63,7 +71,9 @@ impl Erasure {
         if missing > 0 {
             // only support single missing shard for now
             if missing > 1 {
-                return Err(StorageError::Internal("unsupported missing shard count".into()));
+                return Err(StorageError::Internal(
+                    "unsupported missing shard count".into(),
+                ));
             }
             let missing_idx = shards
                 .iter()
@@ -92,12 +102,11 @@ impl Erasure {
         }
 
         let mut out = Vec::with_capacity(orig_len);
-        for i in 0..self.data_blocks {
-            if let Some(shard) = &shards[i] {
-                out.extend_from_slice(shard);
-            } else {
-                return Err(StorageError::Internal("missing data shard".into()));
-            }
+        for shard_opt in shards.iter().take(self.data_blocks) {
+            let shard = shard_opt
+                .as_ref()
+                .ok_or_else(|| StorageError::Internal("missing data shard".into()))?;
+            out.extend_from_slice(shard);
         }
         out.truncate(orig_len);
         Ok(out)

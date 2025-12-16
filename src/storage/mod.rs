@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod common;
 pub mod erasure;
+pub mod file_storage;
 pub mod in_memory;
 
 #[derive(Debug, Clone)]

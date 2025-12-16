@@ -227,8 +227,8 @@ mod tests {
     use crate::pb::{BucketName, ObjectKey};
     use crate::storage::in_memory::InMemoryStorage;
     use async_trait::async_trait;
-    use std::sync::Arc;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[derive(Clone)]
     struct MockAuthenticator {
@@ -639,10 +639,7 @@ mod tests {
         });
         let list_resp = service.list_objects(list_req).await.unwrap().into_inner();
         assert_eq!(list_resp.objects.len(), 1);
-        assert_eq!(
-            list_resp.objects[0].metadata.get("color").unwrap(),
-            "blue"
-        );
+        assert_eq!(list_resp.objects[0].metadata.get("color").unwrap(), "blue");
     }
 
     #[tokio::test]

@@ -1,0 +1,147 @@
+## Overview
+
+This project exposes S3-style HTTP endpoints (path-style) and a gRPC service. It supports SigV4 and header-based auth, XML responses, multipart uploads, range requests, and CopyObject. Storage backends include in-memory and filesystem (selectable via `config.toml`).
+
+## Authentication
+
+- **Header auth (simple)**: `x-access-key`, `x-secret-key`
+- **SigV4**: AWS Signature V4 headers (`Authorization`, `x-amz-date`, `x-amz-content-sha256`, etc.)
+
+Requests without valid credentials return:
+- HTTP 403 with XML `<Code>AccessDenied</Code>`
+
+## HTTP Endpoints (path-style)
+
+- `PUT /{bucket}` — Create bucket  
+  - Errors: `BucketAlreadyExists` (409), `InvalidLocationConstraint` (400)
+- `DELETE /{bucket}` — Delete bucket  
+  - Errors: `BucketNotFound` (404), `BucketNotEmpty` (409)
+- `GET /` — List buckets
+- `GET|HEAD /{bucket}` — Head bucket / list objects (`max-keys`, `prefix`)
+  - Errors: `NoSuchBucket` (404)
+- `PUT /{bucket}/{key}` — Put object (with `Content-Type`, optional `x-amz-meta-*`)
+  - Errors: `NoSuchBucket` (404), `InvalidArgument` (400)
+- `GET|HEAD /{bucket}/{key}` — Get/Head object (supports `Range`, `If-None-Match`)
+  - Errors: `NoSuchBucket` (404), `NoSuchKey` (404), `InvalidRange` (416)
+- `DELETE /{bucket}/{key}` — Delete object  
+  - Errors: `NoSuchBucket` (404), `NoSuchKey` (404)
+- **CopyObject**: `PATCH /{bucket}/{key}` with `x-amz-copy-source: /src_bucket/src_key`
+  - Optional conditionals: `x-amz-copy-source-if-match`, `x-amz-copy-source-if-none-match`, `If-Match`, `If-None-Match`
+  - Metadata directive: `x-amz-metadata-directive: COPY|REPLACE` (+ new `Content-Type` / `x-amz-meta-*` on REPLACE)
+  - Errors: `InvalidArgument` (missing/invalid source), `PreconditionFailed` (ETag conditions), `NoSuchBucket`/`NoSuchKey`
+
+### Multipart Upload
+- Initiate: `POST /{bucket}/{key}?uploads`
+- Upload part: `PUT /{bucket}/{key}?uploadId=ID&partNumber=N`
+- Complete: `POST /{bucket}/{key}?uploadId=ID` with `<CompleteMultipartUpload>` XML
+- Abort: `DELETE /{bucket}/{key}?uploadId=ID`
+- Errors: `NoSuchUpload` (404), `InvalidPart` (400), `NoSuchBucket`/`NoSuchKey`
+
+## Headers Returned
+
+- `x-amz-request-id`, `x-amz-id-2`, `x-amz-bucket-region`
+- Object responses: `ETag`, `Content-Type`, `Content-Length`, `Last-Modified`, `Accept-Ranges`
+- User metadata echoed as `x-amz-meta-*`
+
+## Error Codes (XML)
+
+- `AccessDenied` (403)
+- `NoSuchBucket` (404)
+- `BucketNotEmpty` (409)
+- `BucketAlreadyExists` (409)
+- `NoSuchKey` (404)
+- `NoSuchUpload` (404)
+- `InvalidArgument` (400)
+- `InvalidLocationConstraint` (400)
+- `InvalidPart` (400)
+- `InvalidRange` (416)
+- `PreconditionFailed` (412)
+- `InternalError` (500)
+
+Example error body:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchKey</Code>
+  <Message>The specified key does not exist.</Message>
+  <Resource>/bucket/missing.txt</Resource>
+  <RequestId>req-...</RequestId>
+  <HostId>req-....host</HostId>
+</Error>
+```
+
+## Quick Examples (HTTP)
+
+Create bucket:
+```bash
+curl -X PUT http://localhost:9000/my-bucket \
+  -H "x-access-key: test" -H "x-secret-key: pass"
+```
+
+Put object with metadata:
+```bash
+curl -X PUT http://localhost:9000/my-bucket/notes.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass" \
+  -H "Content-Type: text/plain" \
+  -H "x-amz-meta-color: blue" \
+  --data 'hello'
+```
+
+Range GET:
+```bash
+curl -H "x-access-key: test" -H "x-secret-key: pass" \
+  -H "Range: bytes=0-3" \
+  http://localhost:9000/my-bucket/notes.txt
+```
+
+CopyObject:
+```bash
+curl -X PATCH http://localhost:9000/my-bucket/copy.txt \
+  -H "x-access-key: test" -H "x-secret-key: pass" \
+  -H "x-amz-copy-source: /my-bucket/notes.txt"
+```
+
+Multipart upload:
+```bash
+# Initiate
+UPLOAD_ID=$(curl -s -X POST "http://localhost:9000/bucket/big.dat?uploads" \
+  -H "x-access-key: test" -H "x-secret-key: pass" | \
+  sed -n 's:.*<UploadId>\\(.*\\)</UploadId>.*:\\1:p')
+
+# Upload parts
+curl -X PUT "http://localhost:9000/bucket/big.dat?uploadId=$UPLOAD_ID&partNumber=1" \
+  -H "x-access-key: test" -H "x-secret-key: pass" --data 'part1'
+curl -X PUT "http://localhost:9000/bucket/big.dat?uploadId=$UPLOAD_ID&partNumber=2" \
+  -H "x-access-key: test" -H "x-secret-key: pass" --data 'part2'
+
+# Complete
+cat > complete.xml <<'XML'
+<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>"5d41402abc4b2a76b9719d911017c592"</ETag></Part>
+  <Part><PartNumber>2</PartNumber><ETag>"7d793037a0760186574b0282f2f435e7"</ETag></Part>
+</CompleteMultipartUpload>
+XML
+curl -X POST "http://localhost:9000/bucket/big.dat?uploadId=$UPLOAD_ID" \
+  -H "x-access-key: test" -H "x-secret-key: pass" \
+  --data-binary @complete.xml
+```
+
+## Backends
+- **InMemory**: default, keeps data in RAM with simulated erasure stripes.
+- **FileStorage**: set in `config.toml` (`[storage] backend = "file"; path = "./data"`). Stores shards+parity to disk with JSON sidecars; supports multipart, copy, range.
+
+## gRPC (ObjectStore service)
+
+Methods: `CreateBucket`, `DeleteBucket`, `PutObject`, `GetObject`, `DeleteObject`, `ListObjects`.
+Metadata headers: `x-access-key`, `x-secret-key`.
+
+Example tonic client snippet:
+```rust
+let mut client = ObjectStoreClient::connect("http://localhost:50051").await?;
+let mut req = tonic::Request::new(CreateBucketRequest {
+    bucket: Some(BucketName { name: "bucket".into() }),
+});
+req.metadata_mut().insert("x-access-key", "test".parse().unwrap());
+req.metadata_mut().insert("x-secret-key", "pass".parse().unwrap());
+client.create_bucket(req).await?;
+```

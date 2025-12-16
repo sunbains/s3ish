@@ -15,6 +15,28 @@ pub struct Config {
     /// Prefix for x-amz-request-id / x-amz-id-2 headers (helpful for log correlation)
     #[serde(default = "default_request_id_prefix")]
     pub request_id_prefix: String,
+
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    /// backend can be "in-memory" or "file"
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// path for file backend
+    #[serde(default = "default_path")]
+    pub path: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+            path: default_path(),
+        }
+    }
 }
 
 impl Config {
@@ -31,4 +53,12 @@ fn default_region() -> String {
 
 fn default_request_id_prefix() -> String {
     "req-".to_string()
+}
+
+fn default_backend() -> String {
+    "in-memory".to_string()
+}
+
+fn default_path() -> String {
+    "./data".to_string()
 }

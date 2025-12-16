@@ -98,3 +98,9 @@
   - Phase 1: bucket-level shard map + gateway proxy, single replica to prove routing.
   - Phase 2: enable k+m placement with quorum write/read and healing.
   - Phase 3: scale metadata into partitioned/replicated store; add rebalancing and repair tooling.
+
+### FileStorage vs InMemory (current state)
+- InMemory and FileStorage both support erasure-like striping (InMemory simulated; FileStorage writes shards to disk).
+- FileStorage writes shards+parity to per-object shard directories plus JSON sidecar metadata; reads reconstruct streaming without buffering full objects.
+- InMemory keeps shards in RAM; FileStorage uses tokio async FS, no true zero-copy yet.
+- Both support multipart and CopyObject flows; FileStorage currently uses single parity shard.

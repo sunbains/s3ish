@@ -2,8 +2,8 @@ use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
-use tonic::Request;
 use std::collections::HashMap;
+use tonic::Request;
 
 #[tokio::test]
 async fn in_memory_put_get_roundtrip() {

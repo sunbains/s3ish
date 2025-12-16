@@ -118,3 +118,21 @@
   - **Backward Compatibility**: Unversioned objects stored at traditional paths (`bucket/key.meta`, `bucket/key.shards/`) continue to work
   - **Test Results**: All 142 tests passing (115 unit + 27 integration)
   - **Implementation Status**: Versioning fully functional for both InMemoryStorage and FileStorage
+- 2025-12-16: Refactored versioning into dedicated module following multipart pattern:
+  - **Architecture**: Created VersionStorage trait (7 methods) + VersionManager orchestrator pattern, eliminating ~300 lines of duplicated code
+  - **New Module (`src/storage/versioning.rs`)**:
+    - `VersionStorage` trait: Low-level primitives for version metadata storage (read/write status, store/get/delete metadata, list version IDs, get version data)
+    - `VersionManager<'a, S>`: High-level orchestration (generate_version_id, create_delete_marker, find_latest_version, mark_previous_versions_not_latest)
+    - `VersionMetadata` struct: Internal representation with conversions to/from ObjectMetadata
+  - **InMemoryStorage Refactoring**:
+    - Implemented VersionStorage trait using existing Vec<StoredObject> structure
+    - Refactored StorageBackend methods to delegate to VersionManager: get/put_bucket_versioning, get/head/delete_object_version
+    - Kept get_object/head_object with direct storage access to handle unversioned objects (version_id: None)
+    - Bug fixes: Type conversion in get_version_data, from_object_metadata preserving is_latest/is_delete_marker fields
+  - **FileStorage Refactoring**:
+    - Implemented VersionStorage trait using filesystem versioned paths (.versions/{version_id}/)
+    - Refactored StorageBackend methods to delegate to VersionManager for all versioning operations
+    - Kept list_object_versions with direct filesystem traversal (backend-specific)
+  - **Benefits**: Shared versioning logic, easier to add new storage backends, improved testability, cleaner separation of concerns
+  - **Test Results**: All 121 tests passing (no regressions)
+  - **Implementation Status**: Versioning module fully functional, both InMemoryStorage and FileStorage using shared abstraction

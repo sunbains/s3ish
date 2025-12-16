@@ -2,7 +2,8 @@ use crate::observability::metrics;
 use crate::storage::common::{validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
 use crate::storage::multipart::{MultipartManager, MultipartStorage, UploadMetadata};
-use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
+use crate::storage::versioning::{VersionManager, VersionMetadata, VersionStorage};
+use crate::storage::{ObjectMetadata, StorageBackend, StorageError, VersioningStatus};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -335,6 +336,186 @@ async fn read_stored_meta(meta_path: &Path) -> Result<StoredMeta, StorageError> 
     })?;
     serde_json::from_slice(&meta_bytes)
         .map_err(|e| StorageError::Internal(format!("parse meta: {e}")))
+}
+
+// Implement VersionStorage trait for low-level version operations
+#[async_trait]
+impl VersionStorage for FileStorage {
+    async fn read_versioning_status(&self, bucket: &str) -> Result<VersioningStatus, StorageError> {
+        let path = self.versioning_status_path(bucket);
+        match fs::read_to_string(&path).await {
+            Ok(s) => match s.trim() {
+                "Enabled" => Ok(VersioningStatus::Enabled),
+                "Suspended" => Ok(VersioningStatus::Suspended),
+                _ => Ok(VersioningStatus::Unversioned),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(VersioningStatus::Unversioned)
+            }
+            Err(e) => Err(StorageError::Internal(format!(
+                "read versioning status: {e}"
+            ))),
+        }
+    }
+
+    async fn write_versioning_status(
+        &self,
+        bucket: &str,
+        status: VersioningStatus,
+    ) -> Result<(), StorageError> {
+        let path = self.versioning_status_path(bucket);
+        let status_str = match status {
+            VersioningStatus::Enabled => "Enabled",
+            VersioningStatus::Suspended => "Suspended",
+            VersioningStatus::Unversioned => "Unversioned",
+        };
+        fs::write(&path, status_str)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write versioning status: {e}")))
+    }
+
+    async fn store_version_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        metadata: VersionMetadata,
+    ) -> Result<(), StorageError> {
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+
+        // Ensure parent directory exists
+        if let Some(parent) = meta_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StorageError::Internal(format!("create version meta dir: {e}")))?;
+        }
+
+        let stored = StoredMeta {
+            content_type: metadata.content_type,
+            etag: metadata.etag,
+            size: metadata.size,
+            last_modified_unix_secs: metadata.created_at,
+            metadata: metadata.metadata,
+            data_blocks: Some(self.erasure.data_blocks),
+            parity_blocks: Some(self.erasure.parity_blocks),
+            block_size: Some(self.erasure.block_size),
+            storage_class: metadata.storage_class,
+            server_side_encryption: metadata.server_side_encryption,
+            version_id: Some(metadata.version_id),
+            is_latest: metadata.is_latest,
+            is_delete_marker: metadata.is_delete_marker,
+        };
+
+        let json = serde_json::to_vec(&stored)
+            .map_err(|e| StorageError::Internal(format!("serialize meta: {e}")))?;
+        fs::write(&meta_path, json)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write version meta: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn get_version_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<VersionMetadata, StorageError> {
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+        let stored = read_stored_meta(&meta_path).await?;
+        Ok(VersionMetadata::from_object_metadata(
+            version_id.to_string(),
+            &to_object_metadata(stored),
+        ))
+    }
+
+    async fn list_version_ids(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let versions_dir = self.versions_dir(bucket, key);
+        if !versions_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&versions_dir)
+            .await
+            .map_err(|e| StorageError::Internal(format!("read versions dir: {e}")))?;
+
+        let mut version_ids = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| StorageError::Internal(format!("read version entry: {e}")))?
+        {
+            if let Some(name) = entry.file_name().to_str() {
+                if entry.path().is_dir() {
+                    version_ids.push(name.to_string());
+                }
+            }
+        }
+
+        // Sort in reverse chronological order (newest first)
+        version_ids.sort_by(|a, b| b.cmp(a));
+        Ok(version_ids)
+    }
+
+    async fn delete_version_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<bool, StorageError> {
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+        let shard_dir = self.version_shard_dir(bucket, key, version_id);
+
+        let mut deleted = false;
+
+        // Delete metadata file
+        if meta_path.exists() {
+            fs::remove_file(&meta_path)
+                .await
+                .map_err(|e| StorageError::Internal(format!("delete version meta: {e}")))?;
+            deleted = true;
+        }
+
+        // Delete shard directory
+        if shard_dir.exists() {
+            remove_dir_all(&shard_dir)
+                .await
+                .map_err(|e| StorageError::Internal(format!("delete version shards: {e}")))?;
+        }
+
+        Ok(deleted)
+    }
+
+    async fn get_version_data(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<Bytes, StorageError> {
+        let shard_dir = self.version_shard_dir(bucket, key, version_id);
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+
+        let stored = read_stored_meta(&meta_path).await?;
+
+        // If it's a delete marker, return error
+        if stored.is_delete_marker {
+            return Err(StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let db = stored.data_blocks.unwrap_or(self.erasure.data_blocks);
+        let pb = stored.parity_blocks.unwrap_or(self.erasure.parity_blocks);
+
+        let data = self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?;
+
+        Ok(Bytes::from(data))
+    }
 }
 
 #[async_trait]
@@ -1177,7 +1358,9 @@ impl StorageBackend for FileStorage {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
 
-        self.read_versioning_status(bucket).await
+        // Delegate to VersionManager
+        let manager = VersionManager::new(self);
+        manager.get_bucket_versioning(bucket).await
     }
 
     async fn put_bucket_versioning(
@@ -1193,7 +1376,9 @@ impl StorageBackend for FileStorage {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
 
-        self.write_versioning_status(bucket, status).await
+        // Delegate to VersionManager
+        let manager = VersionManager::new(self);
+        manager.put_bucket_versioning(bucket, status).await
     }
 
     async fn get_object_version(
@@ -1205,30 +1390,9 @@ impl StorageBackend for FileStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let meta_path = self.version_meta_path(bucket, key, version_id);
-        let stored = read_stored_meta(&meta_path).await.map_err(|e| match e {
-            StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => other,
-        })?;
-
-        if stored.is_delete_marker {
-            return Err(StorageError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
-
-        let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
-            let shard_dir = self.version_shard_dir(bucket, key, version_id);
-            self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?
-        } else {
-            return Err(StorageError::Internal("versioned object missing shards".to_string()));
-        };
-
-        Ok((Bytes::from(data), to_object_metadata(stored)))
+        // Delegate to VersionManager
+        let manager = VersionManager::new(self);
+        manager.get_object_version(bucket, key, version_id).await
     }
 
     async fn head_object_version(
@@ -1240,16 +1404,9 @@ impl StorageBackend for FileStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let meta_path = self.version_meta_path(bucket, key, version_id);
-        let stored = read_stored_meta(&meta_path).await.map_err(|e| match e {
-            StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            },
-            other => other,
-        })?;
-
-        Ok(to_object_metadata(stored))
+        // Delegate to VersionManager
+        let manager = VersionManager::new(self);
+        manager.head_object_version(bucket, key, version_id).await
     }
 
     async fn delete_object_version(
@@ -1261,25 +1418,9 @@ impl StorageBackend for FileStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let meta_path = self.version_meta_path(bucket, key, version_id);
-        let shard_dir = self.version_shard_dir(bucket, key, version_id);
-
-        // Delete metadata file
-        let meta_deleted = match fs::remove_file(&meta_path).await {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(StorageError::Internal(format!("delete version meta: {e}"))),
-        };
-
-        // Delete shard directory
-        let _ = remove_dir_all(&shard_dir).await;
-
-        // Delete version directory if empty
-        if let Some(version_dir) = meta_path.parent() {
-            let _ = fs::remove_dir(version_dir).await;
-        }
-
-        Ok(meta_deleted)
+        // Delegate to VersionManager
+        let manager = VersionManager::new(self);
+        manager.delete_object_version(bucket, key, version_id).await
     }
 
     async fn list_object_versions(

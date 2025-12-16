@@ -563,12 +563,94 @@ impl S3HttpHandler {
 
         Ok(())
     }
+
+    /// Extract the principal (access key) from request headers
+    fn extract_principal(&self, headers: &HeaderMap, uri: &Uri) -> Result<String, S3Error> {
+        // Check for pre-signed URL
+        if let Some(presigned) = parse_presigned_params(uri) {
+            return Ok(presigned.access_key);
+        }
+
+        // Check for SigV4 Authorization header
+        if let Some(authz) = headers.get("authorization") {
+            if let Ok(authz_str) = authz.to_str() {
+                if authz_str.starts_with("AWS4-HMAC-SHA256") {
+                    if let Ok(parsed) = parse_sigv4_authorization(authz_str) {
+                        return Ok(parsed.access_key);
+                    }
+                }
+            }
+        }
+
+        // Check for legacy headers
+        if let Some(access_key) = headers
+            .get("x-amz-access-key")
+            .or_else(|| headers.get("x-access-key"))
+        {
+            if let Ok(key) = access_key.to_str() {
+                return Ok(key.to_string());
+            }
+        }
+
+        Ok("anonymous".to_string())
+    }
+
+    /// Check bucket policy for the given operation
+    async fn check_bucket_policy(
+        &self,
+        bucket: &str,
+        key: Option<&str>,
+        action: &str,
+        headers: &HeaderMap,
+        uri: &Uri,
+    ) -> Result<(), S3Error> {
+        use crate::storage::bucket_policy::PolicyDecision;
+
+        // Get the bucket policy
+        let policy = match self.state.handler.storage.get_bucket_policy(bucket).await? {
+            Some(p) => p,
+            None => return Ok(()), // No policy means default allow for authenticated users
+        };
+
+        // Extract principal
+        let principal = self.extract_principal(headers, uri)?;
+
+        // Build resource ARN
+        let resource = if let Some(k) = key {
+            format!("arn:aws:s3:::{}/{}", bucket, k)
+        } else {
+            format!("arn:aws:s3:::{}", bucket)
+        };
+
+        // Evaluate policy
+        match policy.evaluate(&principal, action, &resource) {
+            PolicyDecision::Allow => Ok(()),
+            PolicyDecision::Deny => Err(S3Error::AccessDenied(format!(
+                "Access Denied by bucket policy for action {} on resource {}",
+                action, resource
+            ))),
+            PolicyDecision::ImplicitDeny => {
+                // Implicit deny means no matching statement
+                // For authenticated users with no policy, we allow
+                // For policies that exist but don't match, we check if there's any Allow statement
+                if policy.statements.is_empty() {
+                    Ok(())
+                } else {
+                    Err(S3Error::AccessDenied(format!(
+                        "Access Denied: No matching policy statement for action {} on resource {}",
+                        action, resource
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum S3Error {
     MissingCredentials,
     InvalidCredentials,
+    AccessDenied(String),
     BucketNotFound(String),
     BucketNotEmpty(String),
     BucketAlreadyExists(String),
@@ -1428,6 +1510,12 @@ impl IntoResponse for S3Error {
                     .to_string(),
                 "".to_string(),
             ),
+            S3Error::AccessDenied(msg) => (
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                msg,
+                "".to_string(),
+            ),
             S3Error::BucketNotFound(b) => (
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
@@ -1716,6 +1804,11 @@ async fn put_object(
     };
     s3_handler
         .authenticate(&Method::PUT, &uri, &headers, &body)
+        .await?;
+
+    // Check bucket policy
+    s3_handler
+        .check_bucket_policy(&bucket, Some(&key), "s3:PutObject", &headers, &uri)
         .await?;
 
     if headers.contains_key("x-amz-copy-source") {
@@ -2018,6 +2111,11 @@ async fn get_object(
         (path_bucket, path_key)
     };
 
+    // Check bucket policy
+    s3_handler
+        .check_bucket_policy(&bucket, Some(&key), "s3:GetObject", &headers, &uri)
+        .await?;
+
     let (data, meta) = if let Some(version_id) = params.version_id {
         state.handler.storage.get_object_version(&bucket, &key, &version_id).await?
     } else {
@@ -2191,6 +2289,11 @@ async fn head_object(
         .authenticate(&Method::HEAD, &uri, &headers, &[])
         .await?;
 
+    // Check bucket policy
+    s3_handler
+        .check_bucket_policy(&bucket, Some(&key), "s3:GetObject", &headers, &uri)
+        .await?;
+
     let meta = if let Some(version_id) = params.version_id {
         state.handler.storage.head_object_version(&bucket, &key, &version_id).await?
     } else {
@@ -2266,6 +2369,11 @@ async fn delete_object(
     };
     s3_handler
         .authenticate(&Method::DELETE, &uri, &headers, &[])
+        .await?;
+
+    // Check bucket policy
+    s3_handler
+        .check_bucket_policy(&bucket, Some(&key), "s3:DeleteObject", &headers, &uri)
         .await?;
 
     if let Some(upload_id) = mq.upload_id {
@@ -2375,6 +2483,11 @@ async fn list_objects(
         // If bucket parameter is not empty, it's actually the object key
         if !bucket.is_empty() {
             // This is a GET object request, not list objects
+            // Check bucket policy for GetObject
+            s3_handler
+                .check_bucket_policy(&host_bucket, Some(&bucket), "s3:GetObject", &headers, &uri)
+                .await?;
+
             // Get the object
             let (data, meta) = state.handler.storage.get_object(&host_bucket, &bucket).await?;
 
@@ -2515,6 +2628,11 @@ async fn list_objects(
             .unwrap();
         return Ok(attach_common_headers(resp, &state));
     }
+
+    // Check bucket policy for ListBucket
+    s3_handler
+        .check_bucket_policy(&bucket, None, "s3:ListBucket", &headers, &uri)
+        .await?;
 
     let limit = params.max_keys.unwrap_or(1000) as usize;
     let objects = state
@@ -4756,5 +4874,121 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"nested content");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_enforcement() {
+        use crate::storage::bucket_policy::{Action, BucketPolicy, Effect, Principal, Resource, Statement};
+        use crate::storage::StorageBackend;
+
+        // Create a custom mock authenticator that extracts username from headers
+        struct MultiUserAuthenticator;
+
+        #[async_trait]
+        impl Authenticator for MultiUserAuthenticator {
+            async fn authenticate(&self, req: &tonic::Request<()>) -> Result<AuthContext, AuthError> {
+                let access_key = req
+                    .metadata()
+                    .get("x-access-key")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or(AuthError::MissingCredentials)?;
+                Ok(AuthContext {
+                    access_key: access_key.to_string(),
+                })
+            }
+
+            async fn secret_for(&self, access_key: &str) -> Result<String, AuthError> {
+                // Accept any username for testing
+                Ok(format!("pass-{}", access_key))
+            }
+        }
+
+        // Setup
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
+        storage
+            .put_object(
+                "test-bucket",
+                "test-key",
+                Bytes::from("test data"),
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Create a policy that allows GetObject for user1 but denies for user2
+        let policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![
+                Statement {
+                    sid: Some("AllowUser1".to_string()),
+                    effect: Effect::Allow,
+                    principal: Principal::Aws(crate::storage::bucket_policy::PrincipalValue::Single("user1".to_string())),
+                    action: Action::Single("s3:GetObject".to_string()),
+                    resource: Resource::Single("arn:aws:s3:::test-bucket/*".to_string()),
+                    condition: None,
+                },
+                Statement {
+                    sid: Some("DenyUser2".to_string()),
+                    effect: Effect::Deny,
+                    principal: Principal::Aws(crate::storage::bucket_policy::PrincipalValue::Single("user2".to_string())),
+                    action: Action::Single("s3:GetObject".to_string()),
+                    resource: Resource::Single("arn:aws:s3:::test-bucket/*".to_string()),
+                    condition: None,
+                },
+            ],
+        };
+
+        storage
+            .put_bucket_policy("test-bucket", policy)
+            .await
+            .unwrap();
+
+        let storage = Arc::new(storage);
+        let auth: Arc<dyn Authenticator> = Arc::new(MultiUserAuthenticator);
+
+        let handler = BaseHandler::new(auth, storage);
+        let s3_handler = S3HttpHandler::new(handler);
+        let app = s3_handler.router();
+
+        // Test: user1 should be allowed
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test-bucket/test-key")
+                    .header("x-access-key", "user1")
+                    .header("x-secret-key", "pass1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Test: user2 should be denied
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/test-bucket/test-key")
+                    .header("x-access-key", "user2")
+                    .header("x-secret-key", "pass2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("AccessDenied"));
     }
 }

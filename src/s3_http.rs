@@ -580,6 +580,7 @@ pub enum S3Error {
     InvalidRange(u64),
     PreconditionFailed(String),
     NoSuchLifecycleConfiguration,
+    NoSuchBucketPolicy,
     Internal(String),
 }
 
@@ -1493,6 +1494,12 @@ impl IntoResponse for S3Error {
                 "The lifecycle configuration does not exist.".to_string(),
                 "".to_string(),
             ),
+            S3Error::NoSuchBucketPolicy => (
+                StatusCode::NOT_FOUND,
+                "NoSuchBucketPolicy",
+                "The bucket policy does not exist.".to_string(),
+                "".to_string(),
+            ),
             S3Error::Internal(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -1567,6 +1574,22 @@ async fn create_bucket(
         return Ok(attach_common_headers(resp, &state));
     }
 
+    // Check if this is a PUT bucket policy request
+    if params.policy.is_some() {
+        use crate::storage::bucket_policy::BucketPolicy;
+
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| S3Error::InvalidInput("Invalid JSON encoding".to_string()))?;
+
+        let policy = BucketPolicy::from_json(text)
+            .map_err(|e| S3Error::InvalidInput(format!("Invalid policy: {}", e)))?;
+
+        state.handler.storage.put_bucket_policy(&bucket, policy).await?;
+
+        let resp = (StatusCode::NO_CONTENT, Body::empty()).into_response();
+        return Ok(attach_common_headers(resp, &state));
+    }
+
     if !body.is_empty() {
         parse_create_bucket_configuration(&body, state.context.region())?;
     }
@@ -1605,6 +1628,18 @@ async fn delete_bucket(
 
         if !deleted {
             return Err(S3Error::NoSuchLifecycleConfiguration);
+        }
+
+        let resp = (StatusCode::NO_CONTENT, Body::empty()).into_response();
+        return Ok(attach_common_headers(resp, &state));
+    }
+
+    // Check if this is a DELETE bucket policy request
+    if params.policy.is_some() {
+        let deleted = state.handler.storage.delete_bucket_policy(&bucket).await?;
+
+        if !deleted {
+            return Err(S3Error::NoSuchBucketPolicy);
         }
 
         let resp = (StatusCode::NO_CONTENT, Body::empty()).into_response();
@@ -2265,6 +2300,8 @@ struct ListObjectsParams {
     versioning: Option<String>,  // If present, get/put versioning status
     #[serde(default)]
     lifecycle: Option<String>,  // If present, get/put/delete lifecycle config
+    #[serde(default)]
+    policy: Option<String>,  // If present, get/put/delete bucket policy
 }
 
 #[derive(Deserialize, Default)]
@@ -2410,6 +2447,24 @@ async fn list_objects(
                 return Ok(attach_common_headers(resp, &state));
             }
             None => return Err(S3Error::NoSuchLifecycleConfiguration),
+        }
+    }
+
+    // Check if this is a GET bucket policy request
+    if params.policy.is_some() {
+        match state.handler.storage.get_bucket_policy(&bucket).await? {
+            Some(policy) => {
+                let json = policy
+                    .to_json()
+                    .map_err(|e| S3Error::InvalidInput(format!("serialize policy: {}", e)))?;
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json))
+                    .unwrap();
+                return Ok(attach_common_headers(resp, &state));
+            }
+            None => return Err(S3Error::NoSuchBucketPolicy),
         }
     }
 

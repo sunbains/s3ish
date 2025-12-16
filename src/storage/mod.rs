@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod bucket_policy;
 pub mod common;
 pub mod erasure;
 pub mod file_storage;
@@ -181,4 +182,18 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> Result<(), StorageError>;
 
     async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<bool, StorageError>;
+
+    // Bucket policy operations
+    async fn get_bucket_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<bucket_policy::BucketPolicy>, StorageError>;
+
+    async fn put_bucket_policy(
+        &self,
+        bucket: &str,
+        policy: bucket_policy::BucketPolicy,
+    ) -> Result<(), StorageError>;
+
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<bool, StorageError>;
 }

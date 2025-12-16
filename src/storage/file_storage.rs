@@ -123,6 +123,10 @@ impl FileStorage {
         self.bucket_path(bucket).join(".lifecycle")
     }
 
+    fn bucket_policy_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".policy")
+    }
+
     /// Get the versions directory for an object (e.g., bucket/key/.versions/)
     fn versions_dir(&self, bucket: &str, key: &str) -> PathBuf {
         let obj_path = self.object_path(bucket, key);
@@ -1552,6 +1556,64 @@ impl StorageBackend for FileStorage {
         let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
         manager.delete_policy(bucket).await
     }
+
+    async fn get_bucket_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::bucket_policy::BucketPolicy>, StorageError> {
+        let path = self.bucket_policy_path(bucket);
+        match fs::read(&path).await {
+            Ok(data) => {
+                let policy: crate::storage::bucket_policy::BucketPolicy =
+                    serde_json::from_slice(&data).map_err(|e| {
+                        StorageError::Internal(format!("deserialize bucket policy: {}", e))
+                    })?;
+                Ok(Some(policy))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::Internal(format!(
+                "read bucket policy: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn put_bucket_policy(
+        &self,
+        bucket: &str,
+        policy: crate::storage::bucket_policy::BucketPolicy,
+    ) -> Result<(), StorageError> {
+        // Verify bucket exists
+        let bucket_path = self.bucket_path(bucket);
+        if fs::metadata(&bucket_path).await.is_err() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+
+        // Validate policy
+        policy.validate()?;
+
+        let path = self.bucket_policy_path(bucket);
+        let json = serde_json::to_vec_pretty(&policy).map_err(|e| {
+            StorageError::Internal(format!("serialize bucket policy: {}", e))
+        })?;
+
+        fs::write(&path, json)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write bucket policy: {}", e)))?;
+        Ok(())
+    }
+
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<bool, StorageError> {
+        let path = self.bucket_policy_path(bucket);
+        match fs::remove_file(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StorageError::Internal(format!(
+                "delete bucket policy: {}",
+                e
+            ))),
+        }
+    }
 }
 
 // Implement MultipartStorage trait for low-level multipart operations
@@ -1838,5 +1900,102 @@ mod tests {
             .unwrap();
         let res = storage.delete_bucket("bucket").await;
         assert!(matches!(res, Err(StorageError::BucketNotEmpty(_))));
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_bucket_policy_operations() {
+        use crate::storage::bucket_policy::{Action, BucketPolicy, Effect, Principal, Resource, Statement};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = FileStorage::new(temp_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        storage.create_bucket("test-bucket").await.unwrap();
+
+        // Test getting policy when none exists
+        let policy = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert!(policy.is_none());
+
+        // Test putting a policy
+        let test_policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![Statement {
+                sid: Some("PublicRead".to_string()),
+                effect: Effect::Allow,
+                principal: Principal::All("*".to_string()),
+                action: Action::Single("s3:GetObject".to_string()),
+                resource: Resource::Single("arn:aws:s3:::test-bucket/*".to_string()),
+                condition: None,
+            }],
+        };
+
+        storage
+            .put_bucket_policy("test-bucket", test_policy.clone())
+            .await
+            .unwrap();
+
+        // Test getting the policy
+        let retrieved = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.version, "2012-10-17");
+        assert_eq!(retrieved.statements.len(), 1);
+        assert_eq!(retrieved.statements[0].effect, Effect::Allow);
+
+        // Test deleting the policy
+        let deleted = storage.delete_bucket_policy("test-bucket").await.unwrap();
+        assert!(deleted);
+
+        // Verify policy is gone
+        let policy = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert!(policy.is_none());
+
+        // Test deleting non-existent policy
+        let deleted = storage.delete_bucket_policy("test-bucket").await.unwrap();
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn test_file_storage_bucket_policy_persistence() {
+        use crate::storage::bucket_policy::{Action, BucketPolicy, Effect, Principal, Resource, Statement};
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+
+        // Create storage and add policy
+        {
+            let storage = FileStorage::new(path).await.unwrap();
+            storage.create_bucket("test-bucket").await.unwrap();
+
+            let test_policy = BucketPolicy {
+                version: "2012-10-17".to_string(),
+                statements: vec![Statement {
+                    sid: Some("PublicRead".to_string()),
+                    effect: Effect::Allow,
+                    principal: Principal::All("*".to_string()),
+                    action: Action::Single("s3:GetObject".to_string()),
+                    resource: Resource::Single("arn:aws:s3:::test-bucket/*".to_string()),
+                    condition: None,
+                }],
+            };
+
+            storage
+                .put_bucket_policy("test-bucket", test_policy)
+                .await
+                .unwrap();
+        }
+
+        // Create new storage instance and verify policy persisted
+        {
+            let storage = FileStorage::new(path).await.unwrap();
+            let retrieved = storage.get_bucket_policy("test-bucket").await.unwrap();
+            assert!(retrieved.is_some());
+            let retrieved = retrieved.unwrap();
+            assert_eq!(retrieved.version, "2012-10-17");
+            assert_eq!(retrieved.statements.len(), 1);
+        }
     }
 }

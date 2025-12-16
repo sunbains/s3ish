@@ -37,6 +37,7 @@ pub struct InMemoryStorage {
     bucket_versioning: Arc<RwLock<HashMap<String, VersioningStatus>>>,
     multipart_uploads: Arc<RwLock<HashMap<String, InMemoryUpload>>>,
     lifecycle_policies: Arc<RwLock<HashMap<String, crate::storage::lifecycle::LifecyclePolicy>>>,
+    bucket_policies: Arc<RwLock<HashMap<String, crate::storage::bucket_policy::BucketPolicy>>>,
     erasure: Erasure,
 }
 
@@ -48,6 +49,7 @@ impl InMemoryStorage {
             bucket_versioning: Arc::new(RwLock::new(HashMap::new())),
             multipart_uploads: Arc::new(RwLock::new(HashMap::new())),
             lifecycle_policies: Arc::new(RwLock::new(HashMap::new())),
+            bucket_policies: Arc::new(RwLock::new(HashMap::new())),
             erasure: Erasure::new(4, 2, ERASURE_CHUNK_SIZE).expect("erasure init"),
         }
     }
@@ -837,6 +839,39 @@ impl StorageBackend for InMemoryStorage {
         use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
         let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
         manager.delete_policy(bucket).await
+    }
+
+    async fn get_bucket_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::bucket_policy::BucketPolicy>, StorageError> {
+        let policies = self.bucket_policies.read().await;
+        Ok(policies.get(bucket).cloned())
+    }
+
+    async fn put_bucket_policy(
+        &self,
+        bucket: &str,
+        policy: crate::storage::bucket_policy::BucketPolicy,
+    ) -> Result<(), StorageError> {
+        // Validate bucket exists
+        let buckets = self.buckets.read().await;
+        if !buckets.contains(bucket) {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        drop(buckets);
+
+        // Validate policy
+        policy.validate()?;
+
+        let mut policies = self.bucket_policies.write().await;
+        policies.insert(bucket.to_string(), policy);
+        Ok(())
+    }
+
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<bool, StorageError> {
+        let mut policies = self.bucket_policies.write().await;
+        Ok(policies.remove(bucket).is_some())
     }
 }
 
@@ -1825,5 +1860,104 @@ mod tests {
 
         assert_eq!(head_meta.version_id.as_ref(), Some(version_id));
         assert_eq!(head_meta.size, 8); // "version1" length
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_operations() {
+        use crate::storage::bucket_policy::{Action, BucketPolicy, Effect, Principal, Resource, Statement};
+
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
+
+        // Test getting policy when none exists
+        let policy = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert!(policy.is_none());
+
+        // Test putting a policy
+        let test_policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![Statement {
+                sid: Some("PublicRead".to_string()),
+                effect: Effect::Allow,
+                principal: Principal::All("*".to_string()),
+                action: Action::Single("s3:GetObject".to_string()),
+                resource: Resource::Single("arn:aws:s3:::test-bucket/*".to_string()),
+                condition: None,
+            }],
+        };
+
+        storage
+            .put_bucket_policy("test-bucket", test_policy.clone())
+            .await
+            .unwrap();
+
+        // Test getting the policy
+        let retrieved = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.version, "2012-10-17");
+        assert_eq!(retrieved.statements.len(), 1);
+        assert_eq!(retrieved.statements[0].effect, Effect::Allow);
+
+        // Test deleting the policy
+        let deleted = storage.delete_bucket_policy("test-bucket").await.unwrap();
+        assert!(deleted);
+
+        // Verify policy is gone
+        let policy = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert!(policy.is_none());
+
+        // Test deleting non-existent policy
+        let deleted = storage.delete_bucket_policy("test-bucket").await.unwrap();
+        assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_validation() {
+        use crate::storage::bucket_policy::{Action, BucketPolicy, Effect, Principal, Resource, Statement};
+
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("test-bucket").await.unwrap();
+
+        // Test invalid policy version
+        let invalid_policy = BucketPolicy {
+            version: "2020-01-01".to_string(),
+            statements: vec![Statement {
+                sid: None,
+                effect: Effect::Allow,
+                principal: Principal::All("*".to_string()),
+                action: Action::Single("s3:GetObject".to_string()),
+                resource: Resource::Single("arn:aws:s3:::test-bucket/*".to_string()),
+                condition: None,
+            }],
+        };
+
+        let result = storage
+            .put_bucket_policy("test-bucket", invalid_policy)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_bucket_not_found() {
+        use crate::storage::bucket_policy::{Action, BucketPolicy, Effect, Principal, Resource, Statement};
+
+        let storage = InMemoryStorage::new();
+
+        let policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![Statement {
+                sid: None,
+                effect: Effect::Allow,
+                principal: Principal::All("*".to_string()),
+                action: Action::Single("s3:GetObject".to_string()),
+                resource: Resource::Single("arn:aws:s3:::nonexistent/*".to_string()),
+                condition: None,
+            }],
+        };
+
+        let result = storage.put_bucket_policy("nonexistent", policy).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StorageError::BucketNotFound(_)));
     }
 }

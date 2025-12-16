@@ -51,7 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth: Arc<dyn Authenticator> = Arc::new(FileAuthenticator::new(auth_file).await?);
     let storage: Arc<dyn StorageBackend> = match cfg.storage.backend.as_str() {
         "file" => {
-            let fs = FileStorage::new(&cfg.storage.path).await?;
+            // Use multi-drive configuration if provided, otherwise fall back to single path
+            let drives: Vec<std::path::PathBuf> = cfg.storage.effective_drives()
+                .into_iter()
+                .map(|s| s.into())
+                .collect();
+            let fs = FileStorage::new_multi_drive(drives).await?;
+            tracing::info!(num_drives = fs.num_drives(), "FileStorage initialized with {} drives", fs.num_drives());
             Arc::new(fs)
         }
         _ => Arc::new(InMemoryStorage::new()),

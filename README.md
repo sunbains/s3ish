@@ -127,6 +127,7 @@ Key points about the planned architecture:
 - **Dual Protocol Support**: gRPC and S3-compatible HTTP APIs
 - **Pluggable Architecture**: Easy to swap authentication and storage backends
 - **Multiple Storage Backends**: In-memory and filesystem-based storage with optional erasure coding
+- **Multi-Drive Support**: Distribute erasure-coded shards across multiple drives for maximum throughput
 - **AWS SigV4 Authentication**: Full AWS Signature V4 support plus simple header-based auth
 - **Pre-signed URLs**: Generate temporary authenticated URLs with expiration (up to 7 days)
 - **Virtual-Hosted Style URLs**: Full support for both path-style and virtual-hosted style URLs
@@ -138,7 +139,7 @@ Key points about the planned architecture:
   - Structured logging (JSON/human-readable)
   - Health/readiness probes
   - Grafana dashboard
-- **Comprehensive Tests**: 124+ tests covering all components
+- **Comprehensive Tests**: 155+ tests covering all components including lifecycle integration tests
 
 ## Documentation
 
@@ -274,21 +275,31 @@ Create a `config.toml` file to configure storage backends and authentication:
 ```toml
 listen_addr = "0.0.0.0:9000"
 auth_file = "./creds.txt"
+region = "us-east-1"
 
-# Storage backend: "memory" or "file"
-storage_backend = "memory"
+[storage]
+backend = "file"  # or "in-memory"
 
-# File storage options (when storage_backend = "file")
-# storage_root = "/tmp/s3ish-data"
-# enable_erasure_coding = false
-# erasure_data_blocks = 2
-# erasure_parity_blocks = 1
+# Option 1: Single drive (default for backward compatibility)
+path = "./data"
+
+# Option 2: Multiple drives (recommended for performance)
+# When drives is specified, shards are distributed across drives using modulo sharding
+# This significantly improves performance by avoiding disk seek thrashing
+# drives = ["/mnt/disk1", "/mnt/disk2", "/mnt/disk3", "/mnt/disk4"]
+
+[lifecycle]
+enabled = true
+check_interval_secs = 3600
+max_concurrent_deletes = 100
 ```
 
 ### Storage Backends
 
-- **memory**: Fast in-memory storage (ephemeral)
+- **in-memory**: Fast in-memory storage (ephemeral)
 - **file**: Persistent filesystem-based storage with optional erasure coding for data redundancy
+  - **Single drive**: Traditional setup, all shards stored in one location
+  - **Multi-drive**: High-performance setup distributing shards across multiple physical drives using modulo sharding, avoiding seek thrashing and maximizing aggregate throughput
 
 See [API_USAGE.md](docs/API_USAGE.md) for complete API documentation and [QUICK_START_S3.md](docs/QUICK_START_S3.md) for S3-compatible client examples.
 
@@ -317,7 +328,7 @@ cargo test --test http_file_storage
 cargo test --test observability_integration_test
 ```
 
-All 132+ tests pass covering authentication, storage, gRPC, HTTP handlers, multipart uploads, erasure coding, pre-signed URLs, and observability.
+All 155+ tests pass covering authentication, storage, gRPC, HTTP handlers, multipart uploads, erasure coding, pre-signed URLs, lifecycle policies, and observability.
 
 ### Fuzz Testing
 

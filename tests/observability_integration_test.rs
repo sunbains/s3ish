@@ -6,7 +6,6 @@
 /// - Readiness probe detects backend status
 /// - Metrics are properly recorded
 /// - Structured logging configuration
-
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -258,7 +257,7 @@ fn test_gather_metrics_returns_prometheus_format() {
     // Note: Some metrics may not have HELP/TYPE if they haven't been recorded yet
     // But the output should at least contain some metrics
     assert!(
-        output_str.contains("http_requests_total") || output_str.len() > 0,
+        output_str.contains("http_requests_total") || !output_str.is_empty(),
         "Should contain metrics data"
     );
 }

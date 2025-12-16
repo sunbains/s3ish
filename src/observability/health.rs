@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_health_status_all_healthy() {
-        let checks = vec![
+        let checks = [
             HealthCheck {
                 name: "storage".to_string(),
                 status: "healthy".to_string(),
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_health_status_one_unhealthy() {
-        let checks = vec![
+        let checks = [
             HealthCheck {
                 name: "storage".to_string(),
                 status: "healthy".to_string(),

@@ -559,8 +559,8 @@ mod tests {
         let obj_meta = version_meta.to_object_metadata(1234567890);
 
         assert_eq!(obj_meta.version_id, Some("v123".to_string()));
-        assert_eq!(obj_meta.is_latest, true);
-        assert_eq!(obj_meta.is_delete_marker, false);
+        assert!(obj_meta.is_latest);
+        assert!(!obj_meta.is_delete_marker);
         assert_eq!(obj_meta.content_type, "text/plain");
         assert_eq!(obj_meta.etag, "abc123");
         assert_eq!(obj_meta.size, 1024);
@@ -591,8 +591,8 @@ mod tests {
         let version_meta = VersionMetadata::from_object_metadata(version_id.clone(), &obj_meta);
 
         assert_eq!(version_meta.version_id, version_id);
-        assert_eq!(version_meta.is_latest, false);  // Preserves is_latest from obj_meta
-        assert_eq!(version_meta.is_delete_marker, false);
+        assert!(!version_meta.is_latest);  // Preserves is_latest from obj_meta
+        assert!(!version_meta.is_delete_marker);
         assert_eq!(version_meta.content_type, "application/json");
         assert_eq!(version_meta.etag, "def456");
         assert_eq!(version_meta.size, 2048);

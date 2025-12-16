@@ -28,9 +28,12 @@ pub struct StorageConfig {
     /// backend can be "in-memory" or "file"
     #[serde(default = "default_backend")]
     pub backend: String,
-    /// path for file backend
+    /// path for file backend (deprecated - use drives for multi-drive setups)
     #[serde(default = "default_path")]
     pub path: String,
+    /// multiple drive paths for file backend (spreads shards across drives)
+    #[serde(default)]
+    pub drives: Vec<String>,
 }
 
 impl Default for StorageConfig {
@@ -38,6 +41,18 @@ impl Default for StorageConfig {
         Self {
             backend: default_backend(),
             path: default_path(),
+            drives: Vec::new(),
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Get effective drives - returns drives vec if populated, otherwise single path
+    pub fn effective_drives(&self) -> Vec<String> {
+        if !self.drives.is_empty() {
+            self.drives.clone()
+        } else {
+            vec![self.path.clone()]
         }
     }
 }

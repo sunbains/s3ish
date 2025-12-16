@@ -39,32 +39,74 @@ struct StoredMeta {
     is_delete_marker: bool,
 }
 
-/// Simple filesystem-backed storage. Objects are stored under `root/bucket/key`.
+/// Simple filesystem-backed storage. Objects are stored under `drives[i]/bucket/key`.
 /// Metadata is persisted alongside each object as `<key>.meta` JSON.
+/// Supports multiple drives for spreading shards across physical disks.
 #[derive(Debug, Clone)]
 pub struct FileStorage {
-    root: PathBuf,
+    pub(crate) drives: Vec<PathBuf>,
     erasure: Erasure,
 }
 
 impl FileStorage {
     pub async fn new<P: AsRef<Path>>(root: P) -> Result<Self, StorageError> {
-        let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)
-            .await
-            .map_err(|e| StorageError::Internal(format!("init fs storage: {e}")))?;
+        Self::new_multi_drive(vec![root.as_ref().to_path_buf()]).await
+    }
+
+    pub async fn new_multi_drive(drives: Vec<PathBuf>) -> Result<Self, StorageError> {
+        if drives.is_empty() {
+            return Err(StorageError::InvalidInput(
+                "At least one drive path required".to_string(),
+            ));
+        }
+
+        // Create all drive directories
+        for drive in &drives {
+            fs::create_dir_all(drive)
+                .await
+                .map_err(|e| StorageError::Internal(format!("init drive {:?}: {}", drive, e)))?;
+        }
+
         Ok(Self {
-            root,
+            drives,
             erasure: Erasure::new(4, 1, 1024 * 1024)?,
         })
     }
 
+    /// Get the number of drives
+    pub fn num_drives(&self) -> usize {
+        self.drives.len()
+    }
+
+    /// Get the drive for a specific shard using modulo sharding
+    fn drive_for_shard(&self, shard_idx: usize) -> &Path {
+        let drive_idx = shard_idx % self.drives.len();
+        &self.drives[drive_idx]
+    }
+
+    /// Get primary drive (first drive) for metadata and bucket operations
+    fn primary_drive(&self) -> &Path {
+        &self.drives[0]
+    }
+
     fn bucket_path(&self, bucket: &str) -> PathBuf {
-        self.root.join(bucket)
+        self.primary_drive().join(bucket)
+    }
+
+    fn bucket_path_on_drive(&self, drive: &Path, bucket: &str) -> PathBuf {
+        drive.join(bucket)
     }
 
     fn object_path(&self, bucket: &str, key: &str) -> PathBuf {
         let mut path = self.bucket_path(bucket);
+        for comp in key.split('/') {
+            path.push(comp);
+        }
+        path
+    }
+
+    fn object_path_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
+        let mut path = self.bucket_path_on_drive(drive, bucket);
         for comp in key.split('/') {
             path.push(comp);
         }
@@ -92,8 +134,29 @@ impl FileStorage {
         p
     }
 
+    /// Get shard directory for a specific shard on its designated drive
+    fn shard_dir_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
+        let obj_path = self.object_path_on_drive(drive, bucket, key);
+        let mut p = obj_path;
+        let file_name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("obj")
+            .to_string();
+        p.set_file_name(format!("{}.shards", file_name));
+        p
+    }
+
+    fn temp_root_on_drive(&self, drive: &Path) -> PathBuf {
+        drive.join(".tmp")
+    }
+
+    fn temp_write_dir_on_drive(&self, drive: &Path, write_id: &str) -> PathBuf {
+        self.temp_root_on_drive(drive).join(write_id)
+    }
+
     fn multipart_root(&self) -> PathBuf {
-        self.root.join(".multipart")
+        self.primary_drive().join(".multipart")
     }
 
     fn multipart_upload_dir(&self, upload_id: &str) -> PathBuf {
@@ -197,6 +260,27 @@ impl FileStorage {
     }
 
     /// Read and decode shards from a directory
+    /// Read shards from multiple drives (multi-drive mode)
+    async fn read_shards_multi_drive(&self, bucket: &str, key: &str, db: usize, pb: usize, size: u64) -> Result<Vec<u8>, StorageError> {
+        let total = db + pb.max(1);
+        let mut readers = Vec::new();
+
+        // Open all shard files from their designated drives with buffered readers
+        for idx in 0..total {
+            let drive = self.drive_for_shard(idx);
+            let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+            let shard_path = shard_dir.join(format!("{}", idx));
+
+            match fs::File::open(&shard_path).await {
+                Ok(f) => readers.push(Some(BufReader::with_capacity(65536, f))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => readers.push(None),
+                Err(e) => return Err(StorageError::Internal(format!("open shard {} on {:?}: {}", idx, drive, e))),
+            }
+        }
+
+        self.decode_shards(readers, db, pb, size).await
+    }
+
     async fn read_shards_from_dir(&self, shard_dir: &Path, db: usize, pb: usize, size: u64) -> Result<Vec<u8>, StorageError> {
         let total = db + pb.max(1);
         let mut readers = Vec::new();
@@ -210,6 +294,13 @@ impl FileStorage {
                 Err(e) => return Err(StorageError::Internal(format!("open shard {}: {}", idx, e))),
             }
         }
+
+        self.decode_shards(readers, db, pb, size).await
+    }
+
+    /// Common shard decoding logic (extracted from read_shards_from_dir)
+    async fn decode_shards(&self, mut readers: Vec<Option<BufReader<fs::File>>>, db: usize, pb: usize, size: u64) -> Result<Vec<u8>, StorageError> {
+        let total = db + pb.max(1);
         // streaming decode
         let mut out = Vec::with_capacity(size as usize);
         let mut offset = 0usize;
@@ -566,7 +657,7 @@ impl crate::storage::lifecycle::LifecycleStorage for FileStorage {
 impl StorageBackend for FileStorage {
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
         let mut out = Vec::new();
-        let mut rd = fs::read_dir(&self.root)
+        let mut rd = fs::read_dir(self.primary_drive())
             .await
             .map_err(|e| StorageError::Internal(format!("list buckets: {e}")))?;
         while let Some(entry) = rd
@@ -580,7 +671,10 @@ impl StorageBackend for FileStorage {
                 .map_err(|e| StorageError::Internal(format!("bucket meta: {e}")))?;
             if meta.is_dir() {
                 if let Some(name) = entry.file_name().to_str() {
-                    out.push(name.to_string());
+                    // Skip hidden directories like .tmp, .multipart
+                    if !name.starts_with('.') {
+                        out.push(name.to_string());
+                    }
                 }
             }
         }
@@ -654,7 +748,7 @@ impl StorageBackend for FileStorage {
         let versioning_status = self.read_versioning_status(bucket).await?;
         let is_versioned = versioning_status == crate::storage::VersioningStatus::Enabled;
 
-        let (version_id, shard_dir, meta_path) = if is_versioned {
+        let (version_id, _shard_dir, meta_path) = if is_versioned {
             // Versioning enabled: generate version ID and use versioned paths
             let vid = Self::generate_version_id();
             let shard_dir = self.version_shard_dir(bucket, key, &vid);
@@ -680,24 +774,39 @@ impl StorageBackend for FileStorage {
                 .map_err(|e| StorageError::Internal(format!("create version parents: {e}")))?;
         }
 
-        // Encode shards streaming: write data shards and XOR parity shard(s).
-        if shard_dir.exists() {
-            let _ = fs::remove_dir_all(&shard_dir).await;
-        }
-        fs::create_dir_all(&shard_dir)
-            .await
-            .map_err(|e| StorageError::Internal(format!("create shard dir: {e}")))?;
+        // ATOMIC WRITE PHASE 1: Write to temporary location with unique write ID
+        // Each shard goes to its designated drive using modulo sharding
+        let write_id = uuid::Uuid::new_v4().to_string();
+
         let parity_blocks = self.erasure.parity_blocks.max(1);
         let shard_count = self.erasure.data_blocks + parity_blocks;
 
+        // Create temp directories on each drive that will be used
+        let mut drives_to_init = std::collections::HashSet::new();
+        for idx in 0..shard_count {
+            let drive = self.drive_for_shard(idx);
+            drives_to_init.insert(drive.to_path_buf());
+        }
+
+        for drive in &drives_to_init {
+            let temp_dir = self.temp_write_dir_on_drive(drive, &write_id);
+            fs::create_dir_all(&temp_dir)
+                .await
+                .map_err(|e| StorageError::Internal(format!("create temp dir on {:?}: {}", drive, e)))?;
+        }
+
+        // Open buffered writers for all shards, each on its designated drive
         let mut files = Vec::new();
         for idx in 0..shard_count {
-            let tmp_shard = shard_dir.join(format!("{idx}.tmp"));
-            let file = fs::File::create(&tmp_shard)
+            let drive = self.drive_for_shard(idx);
+            let temp_dir = self.temp_write_dir_on_drive(drive, &write_id);
+            let shard_path = temp_dir.join(format!("shard_{}", idx));
+
+            let file = fs::File::create(&shard_path)
                 .await
-                .map_err(|e| StorageError::Internal(format!("create shard: {e}")))?;
-            // Use BufWriter with 64KB buffer for better I/O performance
-            files.push(BufWriter::with_capacity(65536, file));
+                .map_err(|e| StorageError::Internal(format!("create temp shard {} on {:?}: {}", idx, drive, e)))?;
+            // Use large 256KB buffer for high throughput streaming writes
+            files.push(BufWriter::with_capacity(262144, file));
         }
 
         for stripe_start in
@@ -734,30 +843,114 @@ impl StorageBackend for FileStorage {
             }
         }
 
-        // Flush and rename shards in parallel for better performance
-        let mut handles = Vec::new();
+        // ATOMIC WRITE PHASE 2: Flush all shards in parallel
+        let mut flush_handles = Vec::new();
         for (idx, mut f) in files.into_iter().enumerate() {
-            let shard_dir = shard_dir.to_path_buf();
             let handle = tokio::spawn(async move {
                 f.flush()
                     .await
-                    .map_err(|e| StorageError::Internal(format!("flush shard {}: {}", idx, e)))?;
-                drop(f); // Close file before rename
-                let tmp = shard_dir.join(format!("{}.tmp", idx));
-                let final_path = shard_dir.join(format!("{}", idx));
-                fs::rename(tmp, final_path)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("commit shard {}: {}", idx, e)))?;
+                    .map_err(|e| StorageError::Internal(format!("flush temp shard {}: {}", idx, e)))?;
+                drop(f); // Close file handle
                 Ok::<(), StorageError>(())
             });
-            handles.push(handle);
+            flush_handles.push(handle);
         }
 
-        // Wait for all tasks to complete
-        for handle in handles {
-            handle
-                .await
-                .map_err(|e| StorageError::Internal(format!("flush task failed: {}", e)))??;
+        // Wait for all flushes to complete
+        let mut flush_errors = Vec::new();
+        for (idx, handle) in flush_handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => flush_errors.push(format!("shard {}: {}", idx, e)),
+                Err(e) => flush_errors.push(format!("shard {} task: {}", idx, e)),
+            }
+        }
+
+        // If any flush failed, cleanup temp directories on all drives and return error
+        if !flush_errors.is_empty() {
+            for drive in &drives_to_init {
+                let temp_dir = self.temp_write_dir_on_drive(drive, &write_id);
+                let _ = fs::remove_dir_all(&temp_dir).await;
+            }
+            return Err(StorageError::Internal(format!(
+                "Failed to flush shards: {}",
+                flush_errors.join(", ")
+            )));
+        }
+
+        // ATOMIC WRITE PHASE 3: Verify write quorum (all shards must be written successfully)
+        // Check each shard on its designated drive
+        let mut verified_shards = 0;
+        for idx in 0..shard_count {
+            let drive = self.drive_for_shard(idx);
+            let temp_dir = self.temp_write_dir_on_drive(drive, &write_id);
+            let shard_path = temp_dir.join(format!("shard_{}", idx));
+            if fs::metadata(&shard_path).await.is_ok() {
+                verified_shards += 1;
+            }
+        }
+
+        if verified_shards < shard_count {
+            for drive in &drives_to_init {
+                let temp_dir = self.temp_write_dir_on_drive(drive, &write_id);
+                let _ = fs::remove_dir_all(&temp_dir).await;
+            }
+            return Err(StorageError::Internal(format!(
+                "Write quorum not met: only {} of {} shards written",
+                verified_shards, shard_count
+            )));
+        }
+
+        // ATOMIC WRITE PHASE 4: Commit - Move shards from temp to final location atomically
+        // Create shard directories on each drive and move shards in parallel
+        let mut commit_handles = Vec::new();
+
+        for idx in 0..shard_count {
+            let drive = self.drive_for_shard(idx).to_path_buf();
+            let temp_dir = self.temp_write_dir_on_drive(&drive, &write_id);
+            let temp_shard = temp_dir.join(format!("shard_{}", idx));
+
+            let shard_dir = self.shard_dir_on_drive(&drive, bucket, key);
+            let final_shard = shard_dir.join(format!("{}", idx));
+
+            let handle = tokio::spawn(async move {
+                // Create shard directory if needed
+                if let Some(parent) = final_shard.parent() {
+                    fs::create_dir_all(parent).await
+                        .map_err(|e| StorageError::Internal(format!("create shard dir {}: {}", idx, e)))?;
+                }
+
+                // Atomic rename within same drive
+                fs::rename(&temp_shard, &final_shard)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("commit shard {}: {}", idx, e)))?;
+
+                Ok::<(), StorageError>(())
+            });
+            commit_handles.push(handle);
+        }
+
+        // Wait for all commits
+        let mut commit_errors = Vec::new();
+        for (idx, handle) in commit_handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => commit_errors.push(format!("shard {}: {}", idx, e)),
+                Err(e) => commit_errors.push(format!("shard {} task: {}", idx, e)),
+            }
+        }
+
+        // Cleanup temp directories on all drives
+        for drive in &drives_to_init {
+            let temp_dir = self.temp_write_dir_on_drive(drive, &write_id);
+            let _ = fs::remove_dir_all(&temp_dir).await;
+        }
+
+        if !commit_errors.is_empty() {
+            return Err(StorageError::Internal(format!(
+                "Failed to commit shards: {}",
+                commit_errors.join(", ")
+            )));
         }
 
         let size = data.len() as u64;
@@ -865,8 +1058,8 @@ impl StorageBackend for FileStorage {
         })?;
         tracing::debug!(meta_read_ms = meta_read_start.elapsed().as_secs_f64() * 1000.0, "Metadata read");
         let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
-            let shard_dir = self.shard_dir(&obj_path);
-            self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?
+            // Use multi-drive reading for sharded objects
+            self.read_shards_multi_drive(bucket, key, db, pb, stored.size).await?
         } else {
             fs::read(&obj_path).await.map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {

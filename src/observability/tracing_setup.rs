@@ -1,4 +1,5 @@
 /// Tracing and structured logging configuration
+use std::str::FromStr;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Output format for logging
@@ -10,12 +11,14 @@ pub enum OutputFormat {
     Json,
 }
 
-impl OutputFormat {
-    /// Parse output format from string
-    pub fn from_str(s: &str) -> Self {
+impl FromStr for OutputFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "json" => OutputFormat::Json,
-            _ => OutputFormat::Human,
+            "json" => Ok(OutputFormat::Json),
+            "human" => Ok(OutputFormat::Human),
+            _ => Ok(OutputFormat::Human), // Default to Human for unknown values
         }
     }
 }
@@ -109,7 +112,7 @@ pub fn init_tracing(format: OutputFormat) {
 /// ```
 pub fn init_tracing_from_env() {
     let format_str = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "human".to_string());
-    let format = OutputFormat::from_str(&format_str);
+    let format = OutputFormat::from_str(&format_str).unwrap_or(OutputFormat::Human);
     init_tracing(format);
 }
 
@@ -119,16 +122,16 @@ mod tests {
 
     #[test]
     fn test_output_format_parsing() {
-        assert!(matches!(OutputFormat::from_str("json"), OutputFormat::Json));
-        assert!(matches!(OutputFormat::from_str("JSON"), OutputFormat::Json));
+        assert!(matches!(OutputFormat::from_str("json"), Ok(OutputFormat::Json)));
+        assert!(matches!(OutputFormat::from_str("JSON"), Ok(OutputFormat::Json)));
         assert!(matches!(
             OutputFormat::from_str("human"),
-            OutputFormat::Human
+            Ok(OutputFormat::Human)
         ));
         assert!(matches!(
             OutputFormat::from_str("invalid"),
-            OutputFormat::Human
+            Ok(OutputFormat::Human)
         ));
-        assert!(matches!(OutputFormat::from_str(""), OutputFormat::Human));
+        assert!(matches!(OutputFormat::from_str(""), Ok(OutputFormat::Human)));
     }
 }

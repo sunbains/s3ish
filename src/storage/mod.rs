@@ -6,6 +6,7 @@ pub mod common;
 pub mod erasure;
 pub mod file_storage;
 pub mod in_memory;
+pub mod lifecycle;
 pub mod multipart;
 pub mod versioning;
 
@@ -53,6 +54,7 @@ pub enum StorageError {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_arguments)]
 pub trait StorageBackend: Send + Sync + 'static {
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError>;
     async fn create_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
@@ -164,4 +166,18 @@ pub trait StorageBackend: Send + Sync + 'static {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<ObjectMetadata>, StorageError>;
+
+    // Lifecycle operations
+    async fn get_bucket_lifecycle(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<lifecycle::LifecyclePolicy>, StorageError>;
+
+    async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        policy: lifecycle::LifecyclePolicy,
+    ) -> Result<(), StorageError>;
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<bool, StorageError>;
 }

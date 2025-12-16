@@ -28,12 +28,15 @@ struct StoredObject {
 /// - `bucket_versioning`: versioning status per bucket
 ///
 /// BTreeMap gives deterministic iteration order (useful for tests and predictable listing).
+type ObjectStore = Arc<RwLock<BTreeMap<(String, String), Vec<StoredObject>>>>;
+
 #[derive(Debug, Clone)]
 pub struct InMemoryStorage {
     buckets: Arc<RwLock<BTreeSet<String>>>,
-    objects: Arc<RwLock<BTreeMap<(String, String), Vec<StoredObject>>>>,
+    objects: ObjectStore,
     bucket_versioning: Arc<RwLock<HashMap<String, VersioningStatus>>>,
     multipart_uploads: Arc<RwLock<HashMap<String, InMemoryUpload>>>,
+    lifecycle_policies: Arc<RwLock<HashMap<String, crate::storage::lifecycle::LifecyclePolicy>>>,
     erasure: Erasure,
 }
 
@@ -44,6 +47,7 @@ impl InMemoryStorage {
             objects: Arc::new(RwLock::new(BTreeMap::new())),
             bucket_versioning: Arc::new(RwLock::new(HashMap::new())),
             multipart_uploads: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle_policies: Arc::new(RwLock::new(HashMap::new())),
             erasure: Erasure::new(4, 2, ERASURE_CHUNK_SIZE).expect("erasure init"),
         }
     }
@@ -809,6 +813,31 @@ impl StorageBackend for InMemoryStorage {
 
         Ok(out)
     }
+
+    async fn get_bucket_lifecycle(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::lifecycle::LifecyclePolicy>, StorageError> {
+        use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
+        let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
+        manager.get_policy(bucket).await
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        policy: crate::storage::lifecycle::LifecyclePolicy,
+    ) -> Result<(), StorageError> {
+        use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
+        let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
+        manager.put_policy(bucket, policy).await
+    }
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<bool, StorageError> {
+        use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
+        let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
+        manager.delete_policy(bucket).await
+    }
 }
 
 // Implement MultipartStorage trait for low-level multipart operations
@@ -904,6 +933,43 @@ impl MultipartStorage for InMemoryStorage {
     async fn upload_exists(&self, upload_id: &str) -> bool {
         let uploads = self.multipart_uploads.read().await;
         uploads.contains_key(upload_id)
+    }
+}
+
+// ============================================================================
+// LifecycleStorage Implementation
+// ============================================================================
+
+#[async_trait]
+impl crate::storage::lifecycle::LifecycleStorage for InMemoryStorage {
+    async fn read_lifecycle_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::lifecycle::LifecyclePolicy>, StorageError> {
+        let policies = self.lifecycle_policies.read().await;
+        Ok(policies.get(bucket).cloned())
+    }
+
+    async fn write_lifecycle_policy(
+        &self,
+        bucket: &str,
+        policy: crate::storage::lifecycle::LifecyclePolicy,
+    ) -> Result<(), StorageError> {
+        // Validate bucket exists
+        let buckets = self.buckets.read().await;
+        if !buckets.contains(bucket) {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+        drop(buckets);
+
+        let mut policies = self.lifecycle_policies.write().await;
+        policies.insert(bucket.to_string(), policy);
+        Ok(())
+    }
+
+    async fn delete_lifecycle_policy(&self, bucket: &str) -> Result<bool, StorageError> {
+        let mut policies = self.lifecycle_policies.write().await;
+        Ok(policies.remove(bucket).is_some())
     }
 }
 

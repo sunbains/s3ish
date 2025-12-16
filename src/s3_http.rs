@@ -579,6 +579,7 @@ pub enum S3Error {
     InvalidPart(String),
     InvalidRange(u64),
     PreconditionFailed(String),
+    NoSuchLifecycleConfiguration,
     Internal(String),
 }
 
@@ -1024,6 +1025,7 @@ fn parse_amz_date(date_str: &str) -> Result<DateTime<Utc>, S3Error> {
 ///     &["host"],
 /// )?;
 /// ```
+#[allow(clippy::too_many_arguments)]
 pub fn generate_presigned_url(
     endpoint: &str,
     bucket: &str,
@@ -1057,16 +1059,14 @@ pub fn generate_presigned_url(
     );
 
     // Build query string (without signature)
-    let mut query_params = vec![
-        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+    let mut query_params = [("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
         ("X-Amz-Credential", credential.clone()),
         ("X-Amz-Date", amz_date.clone()),
         ("X-Amz-Expires", expires_in_secs.to_string()),
-        ("X-Amz-SignedHeaders", signed_headers_str.clone()),
-    ];
+        ("X-Amz-SignedHeaders", signed_headers_str.clone())];
 
     // Sort query parameters for canonical query string
-    query_params.sort_by(|a, b| a.0.cmp(&b.0));
+    query_params.sort_by(|a, b| a.0.cmp(b.0));
     let canonical_query_str = query_params
         .iter()
         .map(|(k, v)| {
@@ -1487,6 +1487,12 @@ impl IntoResponse for S3Error {
                 msg,
                 "".to_string(),
             ),
+            S3Error::NoSuchLifecycleConfiguration => (
+                StatusCode::NOT_FOUND,
+                "NoSuchLifecycleConfiguration",
+                "The lifecycle configuration does not exist.".to_string(),
+                "".to_string(),
+            ),
             S3Error::Internal(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -1545,6 +1551,22 @@ async fn create_bucket(
         return Ok(attach_common_headers(resp, &state));
     }
 
+    // Check if this is a PUT lifecycle configuration request
+    if params.lifecycle.is_some() {
+        use crate::storage::lifecycle::parse_lifecycle_xml;
+
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| S3Error::InvalidInput("Invalid XML encoding".to_string()))?;
+
+        let policy = parse_lifecycle_xml(text)
+            .map_err(|e| S3Error::InvalidInput(format!("Invalid lifecycle: {}", e)))?;
+
+        state.handler.storage.put_bucket_lifecycle(&bucket, policy).await?;
+
+        let resp = (StatusCode::OK, Body::empty()).into_response();
+        return Ok(attach_common_headers(resp, &state));
+    }
+
     if !body.is_empty() {
         parse_create_bucket_configuration(&body, state.context.region())?;
     }
@@ -1562,10 +1584,11 @@ async fn create_bucket(
     Ok(attach_common_headers(resp, &state))
 }
 
-/// DELETE /{bucket} - Delete bucket
+/// DELETE /{bucket} - Delete bucket or lifecycle configuration
 async fn delete_bucket(
     State(state): State<S3State>,
     Path(bucket): Path<String>,
+    Query(params): Query<ListObjectsParams>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, S3Error> {
@@ -1575,6 +1598,18 @@ async fn delete_bucket(
     s3_handler
         .authenticate(&Method::DELETE, &uri, &headers, &[])
         .await?;
+
+    // Check if this is a DELETE lifecycle configuration request
+    if params.lifecycle.is_some() {
+        let deleted = state.handler.storage.delete_bucket_lifecycle(&bucket).await?;
+
+        if !deleted {
+            return Err(S3Error::NoSuchLifecycleConfiguration);
+        }
+
+        let resp = (StatusCode::NO_CONTENT, Body::empty()).into_response();
+        return Ok(attach_common_headers(resp, &state));
+    }
 
     let deleted = state.handler.storage.delete_bucket(&bucket).await?;
     if !deleted {
@@ -2228,6 +2263,8 @@ struct ListObjectsParams {
     versions: Option<String>,  // If present, list all versions
     #[serde(default)]
     versioning: Option<String>,  // If present, get/put versioning status
+    #[serde(default)]
+    lifecycle: Option<String>,  // If present, get/put/delete lifecycle config
 }
 
 #[derive(Deserialize, Default)]
@@ -2342,9 +2379,7 @@ async fn list_objects(
 
         let xml = if status == VersioningStatus::Unversioned {
             // Return empty versioning configuration for unversioned buckets
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#
-            )
+            r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#.to_string()
         } else {
             format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>{}</Status></VersioningConfiguration>"#,
@@ -2358,6 +2393,24 @@ async fn list_objects(
             .body(Body::from(xml))
             .unwrap();
         return Ok(attach_common_headers(resp, &state));
+    }
+
+    // Check if this is a GET lifecycle configuration request
+    if params.lifecycle.is_some() {
+        use crate::storage::lifecycle::serialize_lifecycle_xml;
+
+        match state.handler.storage.get_bucket_lifecycle(&bucket).await? {
+            Some(policy) => {
+                let xml = serialize_lifecycle_xml(&policy);
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap();
+                return Ok(attach_common_headers(resp, &state));
+            }
+            None => return Err(S3Error::NoSuchLifecycleConfiguration),
+        }
     }
 
     // Check if this is a list versions request

@@ -119,6 +119,10 @@ impl FileStorage {
         self.bucket_path(bucket).join(".versioning")
     }
 
+    fn lifecycle_policy_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".lifecycle")
+    }
+
     /// Get the versions directory for an object (e.g., bucket/key/.versions/)
     fn versions_dir(&self, bucket: &str, key: &str) -> PathBuf {
         let obj_path = self.object_path(bucket, key);
@@ -290,23 +294,6 @@ impl FileStorage {
                 "read versioning status: {e}"
             ))),
         }
-    }
-
-    async fn write_versioning_status(
-        &self,
-        bucket: &str,
-        status: crate::storage::VersioningStatus,
-    ) -> Result<(), StorageError> {
-        use crate::storage::VersioningStatus;
-        let path = self.versioning_status_path(bucket);
-        let status_str = match status {
-            VersioningStatus::Enabled => "Enabled",
-            VersioningStatus::Suspended => "Suspended",
-            VersioningStatus::Unversioned => "Unversioned",
-        };
-        fs::write(&path, status_str)
-            .await
-            .map_err(|e| StorageError::Internal(format!("write versioning status: {e}")))
     }
 }
 
@@ -515,6 +502,57 @@ impl VersionStorage for FileStorage {
         let data = self.read_shards_from_dir(&shard_dir, db, pb, stored.size).await?;
 
         Ok(Bytes::from(data))
+    }
+}
+
+// Implement LifecycleStorage trait for low-level lifecycle operations
+#[async_trait]
+impl crate::storage::lifecycle::LifecycleStorage for FileStorage {
+    async fn read_lifecycle_policy(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::lifecycle::LifecyclePolicy>, StorageError> {
+        let path = self.lifecycle_policy_path(bucket);
+        match fs::read(&path).await {
+            Ok(data) => {
+                let policy: crate::storage::lifecycle::LifecyclePolicy =
+                    serde_json::from_slice(&data)
+                        .map_err(|e| StorageError::Internal(format!("deserialize lifecycle: {}", e)))?;
+                Ok(Some(policy))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::Internal(format!("read lifecycle: {}", e))),
+        }
+    }
+
+    async fn write_lifecycle_policy(
+        &self,
+        bucket: &str,
+        policy: crate::storage::lifecycle::LifecyclePolicy,
+    ) -> Result<(), StorageError> {
+        // Verify bucket exists
+        let bucket_path = self.bucket_path(bucket);
+        if fs::metadata(&bucket_path).await.is_err() {
+            return Err(StorageError::BucketNotFound(bucket.to_string()));
+        }
+
+        let path = self.lifecycle_policy_path(bucket);
+        let json = serde_json::to_vec_pretty(&policy)
+            .map_err(|e| StorageError::Internal(format!("serialize lifecycle: {}", e)))?;
+
+        fs::write(&path, json)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write lifecycle: {}", e)))?;
+        Ok(())
+    }
+
+    async fn delete_lifecycle_policy(&self, bucket: &str) -> Result<bool, StorageError> {
+        let path = self.lifecycle_policy_path(bucket);
+        match fs::remove_file(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StorageError::Internal(format!("delete lifecycle: {}", e))),
+        }
     }
 }
 
@@ -1461,7 +1499,7 @@ impl StorageBackend for FileStorage {
                         // Found a versions directory - list all versions in it
                         let parent_path = path.parent().unwrap();
                         let key_path = parent_path
-                            .strip_prefix(&self.bucket_path(bucket))
+                            .strip_prefix(self.bucket_path(bucket))
                             .map_err(|_| StorageError::Internal("strip prefix failed".into()))?;
                         let key_str = key_path.to_string_lossy().replace('\\', "/");
 
@@ -1488,6 +1526,31 @@ impl StorageBackend for FileStorage {
         }
 
         Ok(versions)
+    }
+
+    async fn get_bucket_lifecycle(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::storage::lifecycle::LifecyclePolicy>, StorageError> {
+        use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
+        let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
+        manager.get_policy(bucket).await
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        policy: crate::storage::lifecycle::LifecyclePolicy,
+    ) -> Result<(), StorageError> {
+        use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
+        let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
+        manager.put_policy(bucket, policy).await
+    }
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<bool, StorageError> {
+        use crate::storage::lifecycle::{LifecycleManager, LifecycleStorage};
+        let manager = LifecycleManager::new(self as &dyn LifecycleStorage);
+        manager.delete_policy(bucket).await
     }
 }
 

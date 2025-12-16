@@ -169,14 +169,13 @@ impl<'a, S: MultipartStorage> MultipartManager<'a, S> {
                 })?;
 
             // Validate ETag if parts were explicitly specified
-            if validate_etags {
-                if actual_etag.trim_matches('"') != expected_etag.trim_matches('"') {
+            if validate_etags
+                && actual_etag.trim_matches('"') != expected_etag.trim_matches('"') {
                     return Err(StorageError::InvalidPart(format!(
                         "ETag mismatch for part {}: expected {}, got {}",
                         part_num, expected_etag, actual_etag
                     )));
                 }
-            }
 
             combined.extend_from_slice(&data);
         }

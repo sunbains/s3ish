@@ -6,6 +6,7 @@ pub mod common;
 pub mod erasure;
 pub mod file_storage;
 pub mod in_memory;
+pub mod multipart;
 
 #[derive(Debug, Clone)]
 pub struct ObjectMetadata {

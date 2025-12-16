@@ -1,6 +1,7 @@
 use crate::observability::metrics;
 use crate::storage::common::{compute_etag, validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
+use crate::storage::multipart::{InMemoryUpload, MultipartManager, MultipartStorage, PartData, UploadMetadata};
 use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -8,7 +9,6 @@ use chrono::Utc;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks for simulated erasure coding
 
@@ -17,19 +17,6 @@ struct StoredObject {
     shards: Vec<Bytes>,
     orig_len: usize,
     meta: ObjectMetadata,
-}
-
-#[derive(Debug, Clone)]
-struct MultipartUpload {
-    bucket: String,
-    key: String,
-    parts: HashMap<u32, MultipartPart>,
-}
-
-#[derive(Debug, Clone)]
-struct MultipartPart {
-    etag: String,
-    data: Bytes,
 }
 
 /// In-memory storage implementation with simulated erasure coding.
@@ -43,7 +30,7 @@ struct MultipartPart {
 pub struct InMemoryStorage {
     buckets: Arc<RwLock<BTreeSet<String>>>,
     objects: Arc<RwLock<BTreeMap<(String, String), StoredObject>>>,
-    multipart_uploads: Arc<RwLock<HashMap<String, MultipartUpload>>>,
+    multipart_uploads: Arc<RwLock<HashMap<String, InMemoryUpload>>>,
     erasure: Erasure,
 }
 
@@ -329,16 +316,8 @@ impl StorageBackend for InMemoryStorage {
             }
         }
 
-        let upload_id = Uuid::new_v4().simple().to_string();
-        let mut uploads = self.multipart_uploads.write().await;
-        uploads.insert(
-            upload_id.clone(),
-            MultipartUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                parts: HashMap::new(),
-            },
-        );
+        let manager = MultipartManager::new(self);
+        let upload_id = manager.initiate_multipart(bucket, key).await?;
 
         tracing::debug!(
             bucket = %bucket,
@@ -358,31 +337,10 @@ impl StorageBackend for InMemoryStorage {
         part_number: u32,
         data: Bytes,
     ) -> Result<String, StorageError> {
-        let mut uploads = self.multipart_uploads.write().await;
-        let upload = uploads.get_mut(upload_id).ok_or_else(|| {
-            StorageError::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                upload_id: upload_id.to_string(),
-            }
-        })?;
-
-        if upload.bucket != bucket || upload.key != key {
-            return Err(StorageError::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                upload_id: upload_id.to_string(),
-            });
-        }
-
-        let etag = compute_etag(&data);
-        upload.parts.insert(
-            part_number,
-            MultipartPart {
-                etag: etag.clone(),
-                data,
-            },
-        );
+        let manager = MultipartManager::new(self);
+        let etag = manager
+            .upload_part(bucket, key, upload_id, part_number, data)
+            .await?;
 
         tracing::debug!(
             bucket = %bucket,
@@ -402,77 +360,33 @@ impl StorageBackend for InMemoryStorage {
         upload_id: &str,
         parts: Vec<(u32, String)>,
     ) -> Result<ObjectMetadata, StorageError> {
-        let mut uploads = self.multipart_uploads.write().await;
-        let upload = uploads.remove(upload_id).ok_or_else(|| {
-            StorageError::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                upload_id: upload_id.to_string(),
-            }
-        })?;
+        let manager = MultipartManager::new(self);
+        let final_data = manager
+            .prepare_complete_multipart(bucket, key, upload_id, parts)
+            .await?;
 
-        if upload.bucket != bucket || upload.key != key {
-            return Err(StorageError::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                upload_id: upload_id.to_string(),
-            });
-        }
+        let result = self
+            .put_object(
+                bucket,
+                key,
+                final_data,
+                "application/octet-stream",
+                HashMap::new(),
+                None,
+                None,
+            )
+            .await?;
 
-        // Validate parts and collect data
-        let mut ordered_parts = Vec::new();
+        manager.cleanup_multipart(upload_id).await?;
 
-        if parts.is_empty() {
-            // If no parts specified, use all uploaded parts
-            for (part_num, part) in &upload.parts {
-                ordered_parts.push((*part_num, part.clone()));
-            }
-            if ordered_parts.is_empty() {
-                return Err(StorageError::InvalidPart(
-                    "No parts uploaded for completion".to_string(),
-                ));
-            }
-        } else {
-            // Validate specified parts
-            for (part_num, expected_etag) in parts {
-                let part = upload.parts.get(&part_num).ok_or_else(|| {
-                    StorageError::InvalidPart(format!(
-                        "Part {} not found for upload {}",
-                        part_num, upload_id
-                    ))
-                })?;
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            "Multipart upload completed"
+        );
 
-                // Normalize ETags for comparison (remove quotes if present)
-                if part.etag.trim_matches('"') != expected_etag.trim_matches('"') {
-                    return Err(StorageError::InvalidPart(format!(
-                        "ETag mismatch for part {}: expected {}, got {}",
-                        part_num, expected_etag, part.etag
-                    )));
-                }
-
-                ordered_parts.push((part_num, part.clone()));
-            }
-        }
-
-        // Sort by part number and concatenate
-        ordered_parts.sort_by_key(|(n, _)| *n);
-        let mut combined = bytes::BytesMut::new();
-        for (_, part) in ordered_parts {
-            combined.extend_from_slice(&part.data);
-        }
-
-        // Store as a regular object
-        let final_data = combined.freeze();
-        self.put_object(
-            bucket,
-            key,
-            final_data,
-            "application/octet-stream",
-            HashMap::new(),
-            None,
-            None,
-        )
-        .await
+        Ok(result)
     }
 
     async fn abort_multipart(
@@ -481,23 +395,113 @@ impl StorageBackend for InMemoryStorage {
         key: &str,
         upload_id: &str,
     ) -> Result<(), StorageError> {
+        let manager = MultipartManager::new(self);
+        manager.abort_multipart(bucket, key, upload_id).await?;
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            "Multipart upload aborted"
+        );
+
+        Ok(())
+    }
+}
+
+// Implement MultipartStorage trait for low-level multipart operations
+#[async_trait]
+impl MultipartStorage for InMemoryStorage {
+    async fn store_upload_metadata(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), StorageError> {
         let mut uploads = self.multipart_uploads.write().await;
-        match uploads.remove(upload_id) {
-            Some(upload) if upload.bucket == bucket && upload.key == key => {
-                tracing::debug!(
-                    bucket = %bucket,
-                    key = %key,
-                    upload_id = %upload_id,
-                    "Multipart upload aborted"
-                );
-                Ok(())
-            }
-            _ => Err(StorageError::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                upload_id: upload_id.to_string(),
-            }),
-        }
+        uploads.insert(
+            upload_id.to_string(),
+            InMemoryUpload {
+                metadata: UploadMetadata {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                },
+                parts: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_upload_metadata(&self, upload_id: &str) -> Result<(String, String), StorageError> {
+        let uploads = self.multipart_uploads.read().await;
+        uploads
+            .get(upload_id)
+            .map(|u| (u.metadata.bucket.clone(), u.metadata.key.clone()))
+            .ok_or_else(|| StorageError::Internal("Upload not found".to_string()))
+    }
+
+    async fn store_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: Bytes,
+    ) -> Result<String, StorageError> {
+        let mut uploads = self.multipart_uploads.write().await;
+        let upload = uploads
+            .get_mut(upload_id)
+            .ok_or_else(|| StorageError::Internal("Upload not found".to_string()))?;
+
+        let etag = compute_etag(&data);
+        upload.parts.insert(
+            part_number,
+            PartData {
+                etag: etag.clone(),
+                data,
+            },
+        );
+
+        Ok(etag)
+    }
+
+    async fn get_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<(Bytes, String), StorageError> {
+        let uploads = self.multipart_uploads.read().await;
+        let upload = uploads
+            .get(upload_id)
+            .ok_or_else(|| StorageError::Internal("Upload not found".to_string()))?;
+
+        upload
+            .parts
+            .get(&part_number)
+            .map(|p| (p.data.clone(), p.etag.clone()))
+            .ok_or_else(|| StorageError::Internal(format!("Part {} not found", part_number)))
+    }
+
+    async fn list_parts(&self, upload_id: &str) -> Result<Vec<(u32, String)>, StorageError> {
+        let uploads = self.multipart_uploads.read().await;
+        let upload = uploads
+            .get(upload_id)
+            .ok_or_else(|| StorageError::Internal("Upload not found".to_string()))?;
+
+        Ok(upload
+            .parts
+            .iter()
+            .map(|(num, part)| (*num, part.etag.clone()))
+            .collect())
+    }
+
+    async fn remove_upload(&self, upload_id: &str) -> Result<(), StorageError> {
+        let mut uploads = self.multipart_uploads.write().await;
+        uploads.remove(upload_id);
+        Ok(())
+    }
+
+    async fn upload_exists(&self, upload_id: &str) -> bool {
+        let uploads = self.multipart_uploads.read().await;
+        uploads.contains_key(upload_id)
     }
 }
 

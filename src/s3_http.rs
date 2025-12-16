@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use base64;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use hex;
@@ -251,6 +252,8 @@ impl S3State {
                 buf.freeze(),
                 "application/octet-stream",
                 HashMap::new(),
+                None, // storage_class: Will be set via individual parts if needed
+                None, // server_side_encryption: Will be set via individual parts if needed
             )
             .await?;
 
@@ -972,6 +975,19 @@ fn apply_metadata_headers(headers: &mut HeaderMap, metadata: &HashMap<String, St
     }
 }
 
+fn apply_storage_headers(headers: &mut HeaderMap, meta: &crate::storage::ObjectMetadata) {
+    if let Some(ref storage_class) = meta.storage_class {
+        if let Ok(val) = HeaderValue::from_str(storage_class) {
+            let _ = headers.insert("x-amz-storage-class", val);
+        }
+    }
+    if let Some(ref encryption) = meta.server_side_encryption {
+        if let Ok(val) = HeaderValue::from_str(encryption) {
+            let _ = headers.insert("x-amz-server-side-encryption", val);
+        }
+    }
+}
+
 fn attach_request_ids(mut resp: Response, request_id: &str) -> Response {
     let headers = resp.headers_mut();
     let _ = headers.insert(
@@ -1295,11 +1311,35 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
+    // Validate Content-MD5 if provided
+    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
+        let computed_md5 = format!("{:x}", md5::compute(&body));
+        // Content-MD5 header should be base64-encoded MD5, but we'll also accept hex for compatibility
+        let decoded_md5 = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content_md5) {
+            Ok(bytes) => hex::encode(bytes),
+            Err(_) => content_md5.to_string(), // Fallback to treating it as hex
+        };
+        if computed_md5 != decoded_md5 {
+            return Err(S3Error::InvalidInput(
+                "Content-MD5 header does not match computed MD5".to_string(),
+            ));
+        }
+    }
+
     let metadata = extract_user_metadata(&headers);
+    let storage_class = headers
+        .get("x-amz-storage-class")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let server_side_encryption = headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let meta = state
         .handler
         .storage
-        .put_object(&bucket, &key, body, content_type, metadata)
+        .put_object(&bucket, &key, body, content_type, metadata, storage_class, server_side_encryption)
         .await?;
 
     let resp: Response = (
@@ -1361,16 +1401,24 @@ async fn copy_object_internal(
             "Unsupported x-amz-metadata-directive value".to_string(),
         ));
     }
-    let (final_content_type, final_metadata) = if metadata_directive == "REPLACE" {
+    let (final_content_type, final_metadata, final_storage_class, final_encryption) = if metadata_directive == "REPLACE" {
         let md = extract_user_metadata(headers);
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or(&src_meta.content_type)
             .to_string();
-        (content_type, md)
+        let storage_class = headers
+            .get("x-amz-storage-class")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let encryption = headers
+            .get("x-amz-server-side-encryption")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        (content_type, md, storage_class, encryption)
     } else {
-        (src_meta.content_type.clone(), src_meta.metadata.clone())
+        (src_meta.content_type.clone(), src_meta.metadata.clone(), src_meta.storage_class.clone(), src_meta.server_side_encryption.clone())
     };
 
     let dest_meta = match state.handler.storage.head_object(bucket, key).await {
@@ -1434,6 +1482,8 @@ async fn copy_object_internal(
             key,
             &final_content_type,
             final_metadata,
+            final_storage_class,
+            final_encryption,
         )
         .await?;
 
@@ -1541,6 +1591,7 @@ async fn get_object(
             )
                 .into_response();
             apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+            apply_storage_headers(resp.headers_mut(), &meta);
             return Ok(attach_common_headers(resp, &state));
         }
     }
@@ -1575,6 +1626,7 @@ async fn get_object(
         )
             .into_response();
         apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+        apply_storage_headers(resp.headers_mut(), &meta);
         return Ok(attach_common_headers(resp, &state));
     }
 
@@ -1594,6 +1646,7 @@ async fn get_object(
     )
         .into_response();
     apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+    apply_storage_headers(resp.headers_mut(), &meta);
     Ok(attach_common_headers(resp, &state))
 }
 
@@ -1719,6 +1772,7 @@ async fn head_object(
         )
             .into_response();
         apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+        apply_storage_headers(resp.headers_mut(), &meta);
         return Ok(attach_common_headers(resp, &state));
     }
 
@@ -1738,6 +1792,7 @@ async fn head_object(
     )
         .into_response();
     apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+    apply_storage_headers(resp.headers_mut(), &meta);
     Ok(attach_common_headers(resp, &state))
 }
 

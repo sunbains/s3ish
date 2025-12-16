@@ -25,6 +25,10 @@ struct StoredMeta {
     parity_blocks: Option<usize>,
     #[serde(default)]
     block_size: Option<usize>,
+    #[serde(default)]
+    storage_class: Option<String>,
+    #[serde(default)]
+    server_side_encryption: Option<String>,
 }
 
 /// Simple filesystem-backed storage. Objects are stored under `root/bucket/key`.
@@ -88,6 +92,8 @@ fn to_object_metadata(meta: StoredMeta) -> ObjectMetadata {
         size: meta.size,
         last_modified_unix_secs: meta.last_modified_unix_secs,
         metadata: meta.metadata,
+        storage_class: meta.storage_class,
+        server_side_encryption: meta.server_side_encryption,
     }
 }
 
@@ -169,6 +175,8 @@ impl StorageBackend for FileStorage {
         data: Bytes,
         content_type: &str,
         metadata: HashMap<String, String>,
+        storage_class: Option<String>,
+        server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
         let start_time = std::time::Instant::now();
 
@@ -274,6 +282,8 @@ impl StorageBackend for FileStorage {
             data_blocks: Some(self.erasure.data_blocks),
             parity_blocks: Some(self.erasure.parity_blocks),
             block_size: Some(self.erasure.block_size),
+            storage_class,
+            server_side_encryption,
         };
         let meta_bytes =
             serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
@@ -587,6 +597,8 @@ impl StorageBackend for FileStorage {
         dest_key: &str,
         content_type: &str,
         metadata: HashMap<String, String>,
+        storage_class: Option<String>,
+        server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
         validate_bucket(src_bucket)?;
         validate_bucket(dest_bucket)?;
@@ -681,6 +693,8 @@ impl StorageBackend for FileStorage {
             data_blocks: stored.data_blocks,
             parity_blocks: stored.parity_blocks,
             block_size: stored.block_size,
+            storage_class,
+            server_side_encryption,
         };
         let meta_bytes = serde_json::to_vec(&dest_meta)
             .map_err(|e| StorageError::Internal(format!("encode meta: {e}")))?;
@@ -712,6 +726,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 meta_map.clone(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -737,6 +753,8 @@ mod tests {
                 Bytes::from("one"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -747,6 +765,8 @@ mod tests {
                 Bytes::from("two"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -773,6 +793,8 @@ mod tests {
                 Bytes::from("copy me"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -785,6 +807,8 @@ mod tests {
                 "dst.txt",
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -810,6 +834,8 @@ mod tests {
                 Bytes::from(large.clone()),
                 "application/octet-stream",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -822,6 +848,8 @@ mod tests {
                 "big-copy.bin",
                 "application/octet-stream",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -845,6 +873,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();

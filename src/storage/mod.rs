@@ -14,6 +14,8 @@ pub struct ObjectMetadata {
     pub size: u64,
     pub last_modified_unix_secs: i64,
     pub metadata: HashMap<String, String>,
+    pub storage_class: Option<String>,
+    pub server_side_encryption: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -43,6 +45,8 @@ pub trait StorageBackend: Send + Sync + 'static {
         data: bytes::Bytes,
         content_type: &str,
         metadata: HashMap<String, String>,
+        storage_class: Option<String>,
+        server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError>;
 
     async fn get_object(
@@ -69,5 +73,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         dest_key: &str,
         content_type: &str,
         metadata: HashMap<String, String>,
+        storage_class: Option<String>,
+        server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError>;
 }

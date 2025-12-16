@@ -133,6 +133,8 @@ impl ObjectStore for ObjectStoreService {
                     data,
                     &inner.content_type,
                     metadata.clone(),
+                    None, // storage_class: Not exposed in gRPC API yet
+                    None, // server_side_encryption: Not exposed in gRPC API yet
                 )
                 .await
                 .map_err(map_storage_err)?;

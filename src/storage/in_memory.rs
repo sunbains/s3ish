@@ -82,6 +82,8 @@ impl StorageBackend for InMemoryStorage {
         data: Bytes,
         content_type: &str,
         metadata: HashMap<String, String>,
+        storage_class: Option<String>,
+        server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
         let start_time = std::time::Instant::now();
 
@@ -115,6 +117,8 @@ impl StorageBackend for InMemoryStorage {
             size,
             last_modified_unix_secs: Utc::now().timestamp(),
             metadata,
+            storage_class,
+            server_side_encryption,
         };
 
         // measure lock wait for write
@@ -260,6 +264,8 @@ impl StorageBackend for InMemoryStorage {
         dest_key: &str,
         content_type: &str,
         metadata: HashMap<String, String>,
+        storage_class: Option<String>,
+        server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
         validate_bucket(src_bucket)?;
         validate_bucket(dest_bucket)?;
@@ -276,6 +282,8 @@ impl StorageBackend for InMemoryStorage {
             size: data.len() as u64,
             last_modified_unix_secs: Utc::now().timestamp(),
             metadata,
+            storage_class,
+            server_side_encryption,
         };
         let mut objs = self.objects.write().await;
         objs.insert(
@@ -352,6 +360,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -373,6 +383,8 @@ mod tests {
                 data.clone(),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -392,6 +404,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await;
         assert!(matches!(result, Err(StorageError::BucketNotFound(_))));
@@ -408,6 +422,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
@@ -418,7 +434,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         let result = storage
-            .put_object("bucket1", "key1", Bytes::from("data"), "", HashMap::new())
+            .put_object("bucket1", "key1", Bytes::from("data"), "", HashMap::new(), None, None)
             .await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
@@ -435,6 +451,8 @@ mod tests {
                 Bytes::from("data1"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -445,6 +463,8 @@ mod tests {
                 Bytes::from("data2"),
                 "text/html",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -468,6 +488,8 @@ mod tests {
                 original_data.clone(),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -506,6 +528,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -549,6 +573,8 @@ mod tests {
                 Bytes::from("data1"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -559,6 +585,8 @@ mod tests {
                 Bytes::from("data2"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -569,6 +597,8 @@ mod tests {
                 Bytes::from("data3"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -591,6 +621,8 @@ mod tests {
                 Bytes::from("data"),
                 "image/jpeg",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -601,6 +633,8 @@ mod tests {
                 Bytes::from("data"),
                 "image/jpeg",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -611,6 +645,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -636,6 +672,8 @@ mod tests {
                     Bytes::from("data"),
                     "text/plain",
                     HashMap::new(),
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -656,6 +694,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -685,6 +725,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -695,6 +737,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -705,6 +749,8 @@ mod tests {
                 Bytes::from("data"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -728,6 +774,8 @@ mod tests {
                 data.clone(),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -749,6 +797,8 @@ mod tests {
                 Bytes::from("data1"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -759,6 +809,8 @@ mod tests {
                 Bytes::from("data2"),
                 "text/plain",
                 HashMap::new(),
+                None,
+                None,
             )
             .await
             .unwrap();

@@ -17,6 +17,8 @@ async fn in_memory_put_get_roundtrip() {
             bytes::Bytes::from_static(b"hello"),
             "text/plain",
             HashMap::new(),
+            None,
+            None,
         )
         .await
         .unwrap();

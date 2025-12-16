@@ -3,6 +3,7 @@ use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
 use s3ish::config::Config;
 use s3ish::handler::BaseHandler;
+use s3ish::s3_http::ResponseContext;
 use s3ish::server::{ConnectionManager, GrpcConnectionManager, S3HttpConnectionManager};
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
@@ -43,24 +44,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_path(&args.config)?;
 
     // Command line args override config file
-    let addr: SocketAddr = args
-        .listen
-        .as_ref()
-        .unwrap_or(&cfg.listen_addr)
-        .parse()?;
+    let addr: SocketAddr = args.listen.as_ref().unwrap_or(&cfg.listen_addr).parse()?;
 
     // Create shared components
     let auth_file = args.auth_file.as_ref().unwrap_or(&cfg.auth_file);
     let auth: Arc<dyn Authenticator> = Arc::new(FileAuthenticator::new(auth_file).await?);
     let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
     let handler = BaseHandler::new(auth, storage);
+    let response_ctx = ResponseContext::new(cfg.region.clone(), cfg.request_id_prefix.clone());
 
     // Use protocol from command line args
     let protocol = args.protocol.as_str();
 
     match protocol {
         "http" | "s3" => {
-            let server = S3HttpConnectionManager::new(handler);
+            let server = S3HttpConnectionManager::new(handler, response_ctx);
             tracing::info!("s3ish HTTP server listening on {}", addr);
             tracing::info!("auth via headers: x-access-key / x-secret-key (or x-amz-*)");
 

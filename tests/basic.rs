@@ -3,6 +3,7 @@ use s3ish::auth::Authenticator;
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
 use tonic::Request;
+use std::collections::HashMap;
 
 #[tokio::test]
 async fn in_memory_put_get_roundtrip() {
@@ -10,7 +11,13 @@ async fn in_memory_put_get_roundtrip() {
     storage.create_bucket("b1").await.unwrap();
 
     let meta = storage
-        .put_object("b1", "k1", bytes::Bytes::from_static(b"hello"), "text/plain")
+        .put_object(
+            "b1",
+            "k1",
+            bytes::Bytes::from_static(b"hello"),
+            "text/plain",
+            HashMap::new(),
+        )
         .await
         .unwrap();
 
@@ -25,14 +32,19 @@ async fn in_memory_put_get_roundtrip() {
 async fn file_auth_accepts_valid_creds() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("creds.txt");
-    std::fs::write(&path, "a:b
-").unwrap();
+    std::fs::write(
+        &path, "a:b
+",
+    )
+    .unwrap();
 
     let auth = FileAuthenticator::new(path).await.unwrap();
 
     let mut req = Request::new(());
-    req.metadata_mut().insert("x-access-key", "a".parse().unwrap());
-    req.metadata_mut().insert("x-secret-key", "b".parse().unwrap());
+    req.metadata_mut()
+        .insert("x-access-key", "a".parse().unwrap());
+    req.metadata_mut()
+        .insert("x-secret-key", "b".parse().unwrap());
 
     let ctx = auth.authenticate(&req).await.unwrap();
     assert_eq!(ctx.access_key, "a");

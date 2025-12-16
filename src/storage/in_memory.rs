@@ -1,18 +1,22 @@
+use crate::storage::erasure::Erasure;
 use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks for simulated erasure coding
+
 #[derive(Debug, Clone)]
 struct StoredObject {
-    data: Bytes,
+    shards: Vec<Bytes>,
+    orig_len: usize,
     meta: ObjectMetadata,
 }
 
-/// In-memory storage implementation.
+/// In-memory storage implementation with simulated erasure coding.
 ///
 /// Data structures:
 /// - `buckets`: a set of bucket names
@@ -23,6 +27,7 @@ struct StoredObject {
 pub struct InMemoryStorage {
     buckets: Arc<RwLock<BTreeSet<String>>>,
     objects: Arc<RwLock<BTreeMap<(String, String), StoredObject>>>,
+    erasure: Erasure,
 }
 
 impl InMemoryStorage {
@@ -30,13 +35,22 @@ impl InMemoryStorage {
         Self {
             buckets: Arc::new(RwLock::new(BTreeSet::new())),
             objects: Arc::new(RwLock::new(BTreeMap::new())),
+            erasure: Erasure::new(4, 2, ERASURE_CHUNK_SIZE).expect("erasure init"),
         }
+    }
+}
+
+impl Default for InMemoryStorage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 fn validate_bucket(bucket: &str) -> Result<(), StorageError> {
     if bucket.is_empty() {
-        return Err(StorageError::InvalidInput("bucket must be non-empty".into()));
+        return Err(StorageError::InvalidInput(
+            "bucket must be non-empty".into(),
+        ));
     }
     Ok(())
 }
@@ -50,6 +64,11 @@ fn validate_key(key: &str) -> Result<(), StorageError> {
 
 #[async_trait]
 impl StorageBackend for InMemoryStorage {
+    async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+        let b = self.buckets.read().await;
+        Ok(b.iter().cloned().collect())
+    }
+
     async fn create_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
         let mut b = self.buckets.write().await;
@@ -75,11 +94,14 @@ impl StorageBackend for InMemoryStorage {
         key: &str,
         data: Bytes,
         content_type: &str,
+        metadata: HashMap<String, String>,
     ) -> Result<ObjectMetadata, StorageError> {
         validate_bucket(bucket)?;
         validate_key(key)?;
         if content_type.is_empty() {
-            return Err(StorageError::InvalidInput("content_type must be non-empty".into()));
+            return Err(StorageError::InvalidInput(
+                "content_type must be non-empty".into(),
+            ));
         }
 
         // bucket must exist
@@ -91,21 +113,24 @@ impl StorageBackend for InMemoryStorage {
         }
 
         let size = data.len() as u64;
-        let digest = md5::compute(&data);
-        let etag = format!("{:x}", digest);
+        let etag = format!("{:x}", md5::compute(&data));
+        let (shards, orig_len) = self.erasure.encode(&data)?;
+        let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
 
         let meta = ObjectMetadata {
             content_type: content_type.to_string(),
             etag,
             size,
             last_modified_unix_secs: Utc::now().timestamp(),
+            metadata,
         };
 
         let mut objs = self.objects.write().await;
         objs.insert(
             (bucket.to_string(), key.to_string()),
             StoredObject {
-                data,
+                shards,
+                orig_len,
                 meta: meta.clone(),
             },
         );
@@ -120,20 +145,43 @@ impl StorageBackend for InMemoryStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let objs = self.objects.read().await;
-        let obj = objs
-            .get(&(bucket.to_string(), key.to_string()))
-            .ok_or_else(|| StorageError::ObjectNotFound {
+        let obj = objs.get(&(bucket.to_string(), key.to_string())).ok_or_else(|| {
+            StorageError::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-            })?;
-        Ok((obj.data.clone(), obj.meta.clone()))
+            }
+        })?;
+        let mut shards: Vec<Option<Vec<u8>>> = obj.shards.iter().map(|c| Some(c.to_vec())).collect();
+        let data = self.erasure.decode(&mut shards, obj.orig_len)?;
+        Ok((Bytes::from(data), obj.meta.clone()))
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, StorageError> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+        {
+            let b = self.buckets.read().await;
+            if !b.contains(bucket) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+        let objs = self.objects.read().await;
+        let obj = objs.get(&(bucket.to_string(), key.to_string())).ok_or_else(|| {
+            StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            }
+        })?;
+        Ok(obj.meta.clone())
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let mut objs = self.objects.write().await;
-        Ok(objs.remove(&(bucket.to_string(), key.to_string())).is_some())
+        Ok(objs
+            .remove(&(bucket.to_string(), key.to_string()))
+            .is_some())
     }
 
     async fn list_objects(
@@ -169,7 +217,45 @@ impl StorageBackend for InMemoryStorage {
                 break;
             }
         }
+
         Ok(out)
+    }
+
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+        content_type: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<ObjectMetadata, StorageError> {
+        validate_bucket(src_bucket)?;
+        validate_bucket(dest_bucket)?;
+        validate_key(src_key)?;
+        validate_key(dest_key)?;
+
+        let (data, _meta) = self.get_object(src_bucket, src_key).await?;
+        let etag = format!("{:x}", md5::compute(&data));
+        let (shards, orig_len) = self.erasure.encode(&data)?;
+        let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
+        let meta = ObjectMetadata {
+            content_type: content_type.to_string(),
+            etag: etag.clone(),
+            size: data.len() as u64,
+            last_modified_unix_secs: Utc::now().timestamp(),
+            metadata,
+        };
+        let mut objs = self.objects.write().await;
+        objs.insert(
+            (dest_bucket.to_string(), dest_key.to_string()),
+            StoredObject {
+                shards,
+                orig_len,
+                meta: meta.clone(),
+            },
+        );
+        Ok(meta)
     }
 }
 
@@ -182,6 +268,16 @@ mod tests {
         let storage = InMemoryStorage::new();
         let created = storage.create_bucket("bucket1").await.unwrap();
         assert!(created);
+    }
+
+    #[tokio::test]
+    async fn test_list_buckets() {
+        let storage = InMemoryStorage::new();
+        storage.create_bucket("b1").await.unwrap();
+        storage.create_bucket("b2").await.unwrap();
+
+        let buckets = storage.list_buckets().await.unwrap();
+        assert_eq!(buckets, vec!["b1".to_string(), "b2".to_string()]);
     }
 
     #[tokio::test]
@@ -219,7 +315,13 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         storage
-            .put_object("bucket1", "key1", Bytes::from("data"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -234,7 +336,13 @@ mod tests {
 
         let data = Bytes::from("hello world");
         let meta = storage
-            .put_object("bucket1", "key1", data.clone(), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                data.clone(),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -247,7 +355,13 @@ mod tests {
     async fn test_put_object_bucket_not_found() {
         let storage = InMemoryStorage::new();
         let result = storage
-            .put_object("nonexistent", "key1", Bytes::from("data"), "text/plain")
+            .put_object(
+                "nonexistent",
+                "key1",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await;
         assert!(matches!(result, Err(StorageError::BucketNotFound(_))));
     }
@@ -257,7 +371,13 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         let result = storage
-            .put_object("bucket1", "", Bytes::from("data"), "text/plain")
+            .put_object(
+                "bucket1",
+                "",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
@@ -267,7 +387,13 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         let result = storage
-            .put_object("bucket1", "key1", Bytes::from("data"), "")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data"),
+                "",
+                HashMap::new(),
+            )
             .await;
         assert!(matches!(result, Err(StorageError::InvalidInput(_))));
     }
@@ -278,11 +404,23 @@ mod tests {
         storage.create_bucket("bucket1").await.unwrap();
 
         let meta1 = storage
-            .put_object("bucket1", "key1", Bytes::from("data1"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data1"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
         let meta2 = storage
-            .put_object("bucket1", "key1", Bytes::from("data2"), "text/html")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data2"),
+                "text/html",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -299,7 +437,13 @@ mod tests {
         storage.create_bucket("bucket1").await.unwrap();
         let original_data = Bytes::from("test data");
         storage
-            .put_object("bucket1", "key1", original_data.clone(), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                original_data.clone(),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -331,7 +475,13 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         storage
-            .put_object("bucket1", "key1", Bytes::from("data"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -347,7 +497,10 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
 
-        let deleted = storage.delete_object("bucket1", "nonexistent").await.unwrap();
+        let deleted = storage
+            .delete_object("bucket1", "nonexistent")
+            .await
+            .unwrap();
         assert!(!deleted);
     }
 
@@ -365,15 +518,33 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         storage
-            .put_object("bucket1", "key1", Bytes::from("data1"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data1"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
         storage
-            .put_object("bucket1", "key2", Bytes::from("data2"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key2",
+                Bytes::from("data2"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
         storage
-            .put_object("bucket1", "key3", Bytes::from("data3"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key3",
+                Bytes::from("data3"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -389,19 +560,40 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         storage
-            .put_object("bucket1", "photos/2023/1.jpg", Bytes::from("data"), "image/jpeg")
+            .put_object(
+                "bucket1",
+                "photos/2023/1.jpg",
+                Bytes::from("data"),
+                "image/jpeg",
+                HashMap::new(),
+            )
             .await
             .unwrap();
         storage
-            .put_object("bucket1", "photos/2024/1.jpg", Bytes::from("data"), "image/jpeg")
+            .put_object(
+                "bucket1",
+                "photos/2024/1.jpg",
+                Bytes::from("data"),
+                "image/jpeg",
+                HashMap::new(),
+            )
             .await
             .unwrap();
         storage
-            .put_object("bucket1", "docs/readme.txt", Bytes::from("data"), "text/plain")
+            .put_object(
+                "bucket1",
+                "docs/readme.txt",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
-        let objects = storage.list_objects("bucket1", "photos/", 100).await.unwrap();
+        let objects = storage
+            .list_objects("bucket1", "photos/", 100)
+            .await
+            .unwrap();
         assert_eq!(objects.len(), 2);
         assert!(objects[0].0.starts_with("photos/"));
         assert!(objects[1].0.starts_with("photos/"));
@@ -418,6 +610,7 @@ mod tests {
                     &format!("key{}", i),
                     Bytes::from("data"),
                     "text/plain",
+                    HashMap::new(),
                 )
                 .await
                 .unwrap();
@@ -432,7 +625,13 @@ mod tests {
         let storage = InMemoryStorage::new();
         storage.create_bucket("bucket1").await.unwrap();
         storage
-            .put_object("bucket1", "key1", Bytes::from("data"), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -454,9 +653,36 @@ mod tests {
         storage.create_bucket("bucket1").await.unwrap();
 
         // Insert in non-alphabetical order
-        storage.put_object("bucket1", "zebra", Bytes::from("data"), "text/plain").await.unwrap();
-        storage.put_object("bucket1", "apple", Bytes::from("data"), "text/plain").await.unwrap();
-        storage.put_object("bucket1", "middle", Bytes::from("data"), "text/plain").await.unwrap();
+        storage
+            .put_object(
+                "bucket1",
+                "zebra",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                "bucket1",
+                "apple",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                "bucket1",
+                "middle",
+                Bytes::from("data"),
+                "text/plain",
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
 
         let objects = storage.list_objects("bucket1", "", 100).await.unwrap();
         assert_eq!(objects[0].0, "apple");
@@ -471,7 +697,13 @@ mod tests {
 
         let data = Bytes::from("test data");
         let meta1 = storage
-            .put_object("bucket1", "key1", data.clone(), "text/plain")
+            .put_object(
+                "bucket1",
+                "key1",
+                data.clone(),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -486,11 +718,23 @@ mod tests {
         storage.create_bucket("bucket2").await.unwrap();
 
         storage
-            .put_object("bucket1", "shared-key", Bytes::from("data1"), "text/plain")
+            .put_object(
+                "bucket1",
+                "shared-key",
+                Bytes::from("data1"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
         storage
-            .put_object("bucket2", "shared-key", Bytes::from("data2"), "text/plain")
+            .put_object(
+                "bucket2",
+                "shared-key",
+                Bytes::from("data2"),
+                "text/plain",
+                HashMap::new(),
+            )
             .await
             .unwrap();
 
@@ -499,5 +743,26 @@ mod tests {
 
         assert_eq!(&data1[..], b"data1");
         assert_eq!(&data2[..], b"data2");
+    }
+
+    #[tokio::test]
+    async fn test_erasure_encode_decode_roundtrip() {
+        let erasure = Erasure::new(4, 1, ERASURE_CHUNK_SIZE).unwrap();
+        let data = Bytes::from(&b"erasure-coded-data"[..]);
+        let (mut shards, orig_len) = erasure.encode(&data).unwrap();
+        let mut opts: Vec<Option<Vec<u8>>> = shards.drain(..).map(Some).collect();
+        let recovered = erasure.decode(&mut opts, orig_len).unwrap();
+        assert_eq!(Bytes::from(recovered), data);
+    }
+
+    #[tokio::test]
+    async fn test_erasure_recover_single_missing_chunk() {
+        let erasure = Erasure::new(4, 1, ERASURE_CHUNK_SIZE).unwrap();
+        let data = Bytes::from(vec![1u8; ERASURE_CHUNK_SIZE * 2 + 10]);
+        let (shards, orig_len) = erasure.encode(&data).unwrap();
+        let mut opt_shards: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        opt_shards[1] = None;
+        let recovered = erasure.decode(&mut opt_shards, orig_len).unwrap();
+        assert_eq!(Bytes::from(recovered), data);
     }
 }

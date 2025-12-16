@@ -24,6 +24,11 @@ axum = "0.7"
 tower = "0.4"
 http-body-util = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+percent-encoding = "2.3"
+uuid = { version = "1.6", features = ["v4"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.0"

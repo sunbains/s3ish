@@ -1,0 +1,23 @@
+# Progress
+
+- 2025-12-16: Added SigV4 authentication for the S3 HTTP surface (canonical request building, signature verification, and tests covering good/bad signatures). Tests: `cargo test s3_http`.
+- 2025-12-16: Switched HTTP responses to S3-style XML for ListBuckets/ListObjects, added root bucket listing route, quoted ETag headers, and covered new XML paths with tests. Tests: `cargo test s3_http`.
+- 2025-12-16: Introduced a pluggable response renderer trait with an XML implementation for ListBuckets/ListObjects, wired the HTTP handler to use it, and removed JSON (left as future). Added XML error responses to match S3 style. Tests: `cargo test s3_http`.
+- 2025-12-16: Completed XML path: S3-style XML errors, bucket/object delete and create conflict handling, list object KeyCount/Marker fields, and additional XML coverage tests. Tests: `cargo test s3_http`.
+- 2025-12-16: Added request IDs to responses, HEAD object route, stricter error mapping (NoSuchBucket/NoSuchKey/BucketAlreadyExists), and more XML verification tests. Tests: `cargo test s3_http`.
+- 2025-12-16: Ran `cargo clippy` clean (added `Default` for InMemoryStorage) to clear lint warnings. Tests/Lints: `cargo clippy`.
+- 2025-12-16: Added config-driven region/request-id prefix, UUID request IDs, Location header on CreateBucket, CreateBucketConfiguration validation (with region check), HEAD bucket route, and additional XML/error tests. Tests/Lints: `cargo test s3_http`, `cargo clippy`.
+- 2025-12-16: Added bucket-region header on responses, centralized request-id/header attachment, region validation tests, and kept lints/tests clean. Tests/Lints: `cargo test s3_http`, `cargo clippy`.
+- 2025-12-16: Added multipart endpoints (initiate/upload/complete/abort) with XML responses, in-memory upload tracking, NoSuchUpload errors, HostId in XML errors, and coverage tests. Tests/Lints: `cargo test s3_http`, `cargo clippy`.
+- 2025-12-16: Multipart XML fleshed out: CompleteMultipartUpload parsing/validation, in-memory part data assembly into final object, InvalidPart errors, HostId in error XML, region/request-id headers on multipart flows, and expanded tests. Tests/Lints: `cargo test s3_http`, `cargo clippy`.
+- 2025-12-16: Added HTTP-style Last-Modified/Content-Length/Accept-Ranges on object GET/HEAD and kept tests/lints clean. Tests/Lints: `cargo test s3_http`, `cargo clippy`.
+- 2025-12-16: Implemented CopyObject via PATCH with S3-style XML result, percent-decoding of copy source, conditional ETag handling, and coverage tests; clippy/test suite clean. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Enabled CopyObject via standard PUT when x-amz-copy-source is present (shared logic with PATCH), added coverage for PUT copy path, and kept lints/tests clean. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Added destination preconditions for CopyObject (If-Match/If-None-Match), treated missing match as precondition failure, and expanded tests; tests/clippy remain clean. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Added metadata-directive support for CopyObject (REPLACE/COPY) with content-type override, validated invalid directives, and expanded copy tests; suite remains green. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Hardened CopyObject error handling (missing/malformed copy-source, missing source bucket) with new tests; clippy/test suite still clean. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Added CopyObject coverage for missing destination bucket errors; tests/clippy remain clean. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Added user metadata support end-to-end (storage metadata map, x-amz-meta parsing, GET/HEAD echo, CopyObject COPY/REPLACE metadata handling) with new tests; suite/clippy still green. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Added streaming-friendly storage copy API (head/copy_object), switched CopyObject to use metadata-aware copy without buffering in handler, and exposed metadata through gRPC (proto changes, responses, list/get) with new metadata tests. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Improved copy streaming by chunking in storage copy path, added bucket validation on head/copy for better error parity, and kept tests/clippy clean. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Enhanced in-memory storage with simulated erasure coding (chunked stripes + parity), bucket-aware head/copy, and new erasure recovery tests; all tests/clippy remain clean. Tests/Lints: `cargo test`, `cargo clippy`.

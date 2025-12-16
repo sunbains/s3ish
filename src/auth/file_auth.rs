@@ -66,13 +66,21 @@ impl Authenticator for FileAuthenticator {
             _ => Err(AuthError::InvalidCredentials),
         }
     }
+
+    async fn secret_for(&self, access_key: &str) -> Result<String, AuthError> {
+        let guard = self.creds.read().await;
+        guard
+            .get(access_key)
+            .cloned()
+            .ok_or(AuthError::InvalidCredentials)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     async fn create_auth_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -87,8 +95,10 @@ mod tests {
         let auth = FileAuthenticator::new(file.path()).await.unwrap();
 
         let mut req = Request::new(());
-        req.metadata_mut().insert("x-access-key", "user1".parse().unwrap());
-        req.metadata_mut().insert("x-secret-key", "pass1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-access-key", "user1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "pass1".parse().unwrap());
 
         let ctx = auth.authenticate(&req).await.unwrap();
         assert_eq!(ctx.access_key, "user1");
@@ -100,8 +110,10 @@ mod tests {
         let auth = FileAuthenticator::new(file.path()).await.unwrap();
 
         let mut req = Request::new(());
-        req.metadata_mut().insert("x-access-key", "user1".parse().unwrap());
-        req.metadata_mut().insert("x-secret-key", "wrongpass".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-access-key", "user1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "wrongpass".parse().unwrap());
 
         let result = auth.authenticate(&req).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
@@ -113,8 +125,10 @@ mod tests {
         let auth = FileAuthenticator::new(file.path()).await.unwrap();
 
         let mut req = Request::new(());
-        req.metadata_mut().insert("x-access-key", "unknown".parse().unwrap());
-        req.metadata_mut().insert("x-secret-key", "pass1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-access-key", "unknown".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "pass1".parse().unwrap());
 
         let result = auth.authenticate(&req).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
@@ -139,8 +153,10 @@ mod tests {
         let auth = FileAuthenticator::new(file.path()).await.unwrap();
 
         let mut req = Request::new(());
-        req.metadata_mut().insert("x-access-key", "user2".parse().unwrap());
-        req.metadata_mut().insert("x-secret-key", "pass2".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-access-key", "user2".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "pass2".parse().unwrap());
 
         let ctx = auth.authenticate(&req).await.unwrap();
         assert_eq!(ctx.access_key, "user2");
@@ -152,8 +168,10 @@ mod tests {
         let auth = FileAuthenticator::new(file.path()).await.unwrap();
 
         let mut req = Request::new(());
-        req.metadata_mut().insert("x-access-key", "user1".parse().unwrap());
-        req.metadata_mut().insert("x-secret-key", "pass1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-access-key", "user1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "pass1".parse().unwrap());
 
         let ctx = auth.authenticate(&req).await.unwrap();
         assert_eq!(ctx.access_key, "user1");
@@ -178,8 +196,10 @@ mod tests {
 
         // Test with initial credentials
         let mut req = Request::new(());
-        req.metadata_mut().insert("x-access-key", "user1".parse().unwrap());
-        req.metadata_mut().insert("x-secret-key", "pass1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-access-key", "user1".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "pass1".parse().unwrap());
         auth.authenticate(&req).await.unwrap();
 
         // Update the file - truncate and rewrite
@@ -192,8 +212,10 @@ mod tests {
         auth.reload().await.unwrap();
 
         let mut req2 = Request::new(());
-        req2.metadata_mut().insert("x-access-key", "user2".parse().unwrap());
-        req2.metadata_mut().insert("x-secret-key", "pass2".parse().unwrap());
+        req2.metadata_mut()
+            .insert("x-access-key", "user2".parse().unwrap());
+        req2.metadata_mut()
+            .insert("x-secret-key", "pass2".parse().unwrap());
         let ctx = auth.authenticate(&req2).await.unwrap();
         assert_eq!(ctx.access_key, "user2");
 

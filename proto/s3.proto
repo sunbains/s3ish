@@ -15,12 +15,14 @@ message PutObjectRequest {
   ObjectKey object = 1;
   bytes data = 2;
   string content_type = 3;
+  map<string, string> metadata = 4;
 }
 
 message PutObjectResponse {
   string etag = 1;
   uint64 size = 2;
   google.protobuf.Timestamp last_modified = 3;
+  map<string, string> metadata = 4;
 }
 
 message GetObjectRequest { ObjectKey object = 1; }
@@ -30,6 +32,7 @@ message GetObjectResponse {
   string content_type = 2;
   string etag = 3;
   google.protobuf.Timestamp last_modified = 4;
+  map<string, string> metadata = 5;
 }
 
 message DeleteObjectRequest { ObjectKey object = 1; }
@@ -53,6 +56,7 @@ message ObjectInfo {
   string etag = 3;
   string content_type = 4;
   google.protobuf.Timestamp last_modified = 5;
+  map<string, string> metadata = 6;
 }
 
 message ListObjectsResponse {

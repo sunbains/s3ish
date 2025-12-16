@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod erasure;
 pub mod in_memory;
 
 #[derive(Debug, Clone)]
@@ -9,6 +11,7 @@ pub struct ObjectMetadata {
     pub etag: String,
     pub size: u64,
     pub last_modified_unix_secs: i64,
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Error)]
@@ -27,6 +30,7 @@ pub enum StorageError {
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync + 'static {
+    async fn list_buckets(&self) -> Result<Vec<String>, StorageError>;
     async fn create_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
     async fn delete_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
 
@@ -36,6 +40,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         key: &str,
         data: bytes::Bytes,
         content_type: &str,
+        metadata: HashMap<String, String>,
     ) -> Result<ObjectMetadata, StorageError>;
 
     async fn get_object(
@@ -43,6 +48,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         bucket: &str,
         key: &str,
     ) -> Result<(bytes::Bytes, ObjectMetadata), StorageError>;
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, StorageError>;
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError>;
 
@@ -52,4 +58,14 @@ pub trait StorageBackend: Send + Sync + 'static {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, ObjectMetadata)>, StorageError>;
+
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dest_bucket: &str,
+        dest_key: &str,
+        content_type: &str,
+        metadata: HashMap<String, String>,
+    ) -> Result<ObjectMetadata, StorageError>;
 }

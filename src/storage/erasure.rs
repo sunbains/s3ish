@@ -1,0 +1,105 @@
+use crate::storage::StorageError;
+
+/// Very small XOR-based erasure helper that simulates data+parity shards.
+/// Supports reconstruction of a single missing shard when parity is present.
+#[derive(Debug, Clone)]
+pub struct Erasure {
+    data_blocks: usize,
+    parity_blocks: usize,
+    block_size: usize,
+}
+
+impl Erasure {
+    pub fn new(data_blocks: usize, parity_blocks: usize, block_size: usize) -> Result<Self, StorageError> {
+        if data_blocks == 0 {
+            return Err(StorageError::InvalidInput("data_blocks must be > 0".into()));
+        }
+        Ok(Self {
+            data_blocks,
+            parity_blocks,
+            block_size: block_size.max(1),
+        })
+    }
+
+    pub fn encode(&self, data: &[u8]) -> Result<(Vec<Vec<u8>>, usize), StorageError> {
+        if data.is_empty() {
+            return Err(StorageError::InvalidInput("data cannot be empty".into()));
+        }
+        let shard_len = ((data.len() + self.data_blocks - 1) / self.data_blocks).max(1);
+        let total_shards = self.data_blocks + self.parity_blocks.max(1);
+        let mut shards = vec![vec![0u8; shard_len]; total_shards];
+
+        for i in 0..self.data_blocks {
+            let start = i * shard_len;
+            if start < data.len() {
+                let end = std::cmp::min(start + shard_len, data.len());
+                shards[i][..end - start].copy_from_slice(&data[start..end]);
+            }
+        }
+
+        // parity shard = XOR of all data shards
+        let parity_idx = self.data_blocks;
+        let (data_shards, parity_shards) = shards.split_at_mut(parity_idx);
+        let parity = &mut parity_shards[0];
+        for shard in data_shards.iter() {
+            for (j, b) in shard.iter().enumerate() {
+                parity[j] ^= b;
+            }
+        }
+
+        Ok((shards, data.len()))
+    }
+
+    pub fn decode(&self, shards: &mut [Option<Vec<u8>>], orig_len: usize) -> Result<Vec<u8>, StorageError> {
+        if shards.len() < self.data_blocks + 1 {
+            return Err(StorageError::InvalidInput("not enough shards".into()));
+        }
+        let missing = shards.iter().filter(|s| s.is_none()).count();
+        if missing > self.parity_blocks.max(1) {
+            return Err(StorageError::Internal("too many missing shards".into()));
+        }
+
+        // If a data shard is missing, reconstruct using parity.
+        if missing > 0 {
+            // only support single missing shard for now
+            if missing > 1 {
+                return Err(StorageError::Internal("unsupported missing shard count".into()));
+            }
+            let missing_idx = shards
+                .iter()
+                .enumerate()
+                .find_map(|(i, s)| if s.is_none() { Some(i) } else { None })
+                .unwrap();
+
+            let shard_len = shards
+                .iter()
+                .filter_map(|s| s.as_ref().map(|v| v.len()))
+                .max()
+                .unwrap_or(self.block_size);
+
+            let mut recovered = vec![0u8; shard_len];
+            for (i, shard_opt) in shards.iter().enumerate() {
+                if i == missing_idx {
+                    continue;
+                }
+                if let Some(shard) = shard_opt {
+                    for (j, b) in shard.iter().enumerate() {
+                        recovered[j] ^= b;
+                    }
+                }
+            }
+            shards[missing_idx] = Some(recovered);
+        }
+
+        let mut out = Vec::with_capacity(orig_len);
+        for i in 0..self.data_blocks {
+            if let Some(shard) = &shards[i] {
+                out.extend_from_slice(shard);
+            } else {
+                return Err(StorageError::Internal("missing data shard".into()));
+            }
+        }
+        out.truncate(orig_len);
+        Ok(out)
+    }
+}

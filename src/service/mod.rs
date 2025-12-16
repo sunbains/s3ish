@@ -1,10 +1,10 @@
 use crate::auth::AuthError;
 use crate::handler::BaseHandler;
 use crate::pb::{
-    object_store_server::ObjectStore, CreateBucketRequest, CreateBucketResponse, DeleteBucketRequest,
-    DeleteBucketResponse, DeleteObjectRequest, DeleteObjectResponse, GetObjectRequest,
-    GetObjectResponse, ListObjectsRequest, ListObjectsResponse, ObjectInfo, PutObjectRequest,
-    PutObjectResponse,
+    object_store_server::ObjectStore, CreateBucketRequest, CreateBucketResponse,
+    DeleteBucketRequest, DeleteBucketResponse, DeleteObjectRequest, DeleteObjectResponse,
+    GetObjectRequest, GetObjectResponse, ListObjectsRequest, ListObjectsResponse, ObjectInfo,
+    PutObjectRequest, PutObjectResponse,
 };
 use crate::storage::StorageError;
 use prost_types::Timestamp;
@@ -47,8 +47,12 @@ fn ts_from_unix_secs(secs: i64) -> Timestamp {
 fn map_storage_err(e: StorageError) -> Status {
     match e {
         StorageError::BucketNotFound(b) => Status::not_found(format!("bucket not found: {b}")),
-        StorageError::BucketNotEmpty(b) => Status::failed_precondition(format!("bucket not empty: {b}")),
-        StorageError::ObjectNotFound { bucket, key } => Status::not_found(format!("object not found: {bucket}/{key}")),
+        StorageError::BucketNotEmpty(b) => {
+            Status::failed_precondition(format!("bucket not empty: {b}"))
+        }
+        StorageError::ObjectNotFound { bucket, key } => {
+            Status::not_found(format!("object not found: {bucket}/{key}"))
+        }
         StorageError::InvalidInput(m) => Status::invalid_argument(m),
         StorageError::Internal(m) => Status::internal(m),
     }
@@ -75,7 +79,12 @@ impl ObjectStore for ObjectStoreService {
             .ok_or_else(|| Status::invalid_argument("bucket is required"))?
             .name;
 
-        let created = self.handler.storage.create_bucket(&bucket).await.map_err(map_storage_err)?;
+        let created = self
+            .handler
+            .storage
+            .create_bucket(&bucket)
+            .await
+            .map_err(map_storage_err)?;
         Ok(Response::new(CreateBucketResponse { created }))
     }
 
@@ -90,7 +99,12 @@ impl ObjectStore for ObjectStoreService {
             .ok_or_else(|| Status::invalid_argument("bucket is required"))?
             .name;
 
-        let deleted = self.handler.storage.delete_bucket(&bucket).await.map_err(map_storage_err)?;
+        let deleted = self
+            .handler
+            .storage
+            .delete_bucket(&bucket)
+            .await
+            .map_err(map_storage_err)?;
         Ok(Response::new(DeleteBucketResponse { deleted }))
     }
 
@@ -104,10 +118,17 @@ impl ObjectStore for ObjectStoreService {
             .object
             .ok_or_else(|| Status::invalid_argument("object is required"))?;
         let data = bytes::Bytes::from(inner.data);
+        let metadata = inner.metadata;
         let meta = self
             .handler
             .storage
-            .put_object(&obj.bucket, &obj.key, data, &inner.content_type)
+            .put_object(
+                &obj.bucket,
+                &obj.key,
+                data,
+                &inner.content_type,
+                metadata.clone(),
+            )
             .await
             .map_err(map_storage_err)?;
 
@@ -115,6 +136,7 @@ impl ObjectStore for ObjectStoreService {
             etag: meta.etag,
             size: meta.size,
             last_modified: Some(ts_from_unix_secs(meta.last_modified_unix_secs)),
+            metadata,
         }))
     }
 
@@ -140,6 +162,7 @@ impl ObjectStore for ObjectStoreService {
             content_type: meta.content_type,
             etag: meta.etag,
             last_modified: Some(ts_from_unix_secs(meta.last_modified_unix_secs)),
+            metadata: meta.metadata,
         }))
     }
 
@@ -169,7 +192,11 @@ impl ObjectStore for ObjectStoreService {
         self.authenticate(&req).await?;
         let inner = req.into_inner();
 
-        let limit = if inner.limit == 0 { 1000 } else { inner.limit as usize };
+        let limit = if inner.limit == 0 {
+            1000
+        } else {
+            inner.limit as usize
+        };
         let objs = self
             .handler
             .storage
@@ -185,6 +212,7 @@ impl ObjectStore for ObjectStoreService {
                 etag: meta.etag,
                 content_type: meta.content_type,
                 last_modified: Some(ts_from_unix_secs(meta.last_modified_unix_secs)),
+                metadata: meta.metadata,
             })
             .collect();
 
@@ -200,6 +228,7 @@ mod tests {
     use crate::storage::in_memory::InMemoryStorage;
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::collections::HashMap;
 
     #[derive(Clone)]
     struct MockAuthenticator {
@@ -333,6 +362,7 @@ mod tests {
             }),
             data: b"test data".to_vec(),
             content_type: "text/plain".to_string(),
+            metadata: HashMap::new(),
         });
 
         let response = service.put_object(put_req).await.unwrap();
@@ -349,6 +379,7 @@ mod tests {
             object: None,
             data: b"test data".to_vec(),
             content_type: "text/plain".to_string(),
+            metadata: HashMap::new(),
         });
 
         let result = service.put_object(req).await;
@@ -376,6 +407,7 @@ mod tests {
             }),
             data: b"test data".to_vec(),
             content_type: "text/plain".to_string(),
+            metadata: HashMap::new(),
         });
         service.put_object(put_req).await.unwrap();
 
@@ -440,6 +472,7 @@ mod tests {
             }),
             data: b"test data".to_vec(),
             content_type: "text/plain".to_string(),
+            metadata: HashMap::new(),
         });
         service.put_object(put_req).await.unwrap();
 
@@ -500,6 +533,7 @@ mod tests {
                 }),
                 data: format!("data{}", i).into_bytes(),
                 content_type: "text/plain".to_string(),
+                metadata: HashMap::new(),
             });
             service.put_object(put_req).await.unwrap();
         }
@@ -540,6 +574,7 @@ mod tests {
                 }),
                 data: b"data".to_vec(),
                 content_type: "text/plain".to_string(),
+                metadata: HashMap::new(),
             });
             service.put_object(put_req).await.unwrap();
         }
@@ -556,6 +591,58 @@ mod tests {
         assert_eq!(inner.objects.len(), 2);
         assert!(inner.objects[0].key.starts_with("photos/"));
         assert!(inner.objects[1].key.starts_with("photos/"));
+    }
+
+    #[tokio::test]
+    async fn test_service_metadata_roundtrip() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "meta-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Put object with metadata
+        let mut meta = HashMap::new();
+        meta.insert("color".to_string(), "blue".to_string());
+        meta.insert("flag".to_string(), "yes".to_string());
+        let put_req = create_authenticated_request(PutObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "meta-bucket".to_string(),
+                key: "item".to_string(),
+            }),
+            data: b"data".to_vec(),
+            content_type: "text/plain".to_string(),
+            metadata: meta.clone(),
+        });
+        service.put_object(put_req).await.unwrap();
+
+        // Get should include metadata
+        let get_req = create_authenticated_request(GetObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "meta-bucket".to_string(),
+                key: "item".to_string(),
+            }),
+        });
+        let get_resp = service.get_object(get_req).await.unwrap().into_inner();
+        assert_eq!(get_resp.metadata.get("color").unwrap(), "blue");
+        assert_eq!(get_resp.metadata.get("flag").unwrap(), "yes");
+
+        // List should include metadata
+        let list_req = create_authenticated_request(ListObjectsRequest {
+            bucket: "meta-bucket".to_string(),
+            prefix: "".to_string(),
+            limit: 10,
+        });
+        let list_resp = service.list_objects(list_req).await.unwrap().into_inner();
+        assert_eq!(list_resp.objects.len(), 1);
+        assert_eq!(
+            list_resp.objects[0].metadata.get("color").unwrap(),
+            "blue"
+        );
     }
 
     #[tokio::test]

@@ -809,6 +809,9 @@ impl StorageBackend for FileStorage {
             files.push(BufWriter::with_capacity(262144, file));
         }
 
+        // Compute MD5 incrementally while writing shards (single pass through data)
+        let mut md5_context = md5::Context::new();
+
         for stripe_start in
             (0..data.len()).step_by(self.erasure.block_size * self.erasure.data_blocks)
         {
@@ -822,6 +825,10 @@ impl StorageBackend for FileStorage {
                 }
                 let end = std::cmp::min(offset + self.erasure.block_size, data.len());
                 let slice = &data[offset..end];
+
+                // Update MD5 hash incrementally
+                md5_context.consume(slice);
+
                 files[shard_idx]
                     .write_all(slice)
                     .await
@@ -954,7 +961,8 @@ impl StorageBackend for FileStorage {
         }
 
         let size = data.len() as u64;
-        let etag = format!("{:x}", md5::compute(&data));
+        // Use the incrementally computed MD5 hash (computed during erasure coding loop)
+        let etag = format!("{:x}", md5_context.compute());
         let stored_meta = StoredMeta {
             content_type: content_type.to_string(),
             etag: etag.clone(),

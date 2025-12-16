@@ -30,3 +30,47 @@ pub fn metadata_creds(req: &Request<()>) -> Option<(String, String)> {
     let sk = req.metadata().get("x-secret-key")?.to_str().ok()?.to_string();
     Some((ak, sk))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metadata_creds_success() {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-access-key", "access123".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "secret456".parse().unwrap());
+
+        let result = metadata_creds(&req);
+        assert_eq!(result, Some(("access123".to_string(), "secret456".to_string())));
+    }
+
+    #[test]
+    fn test_metadata_creds_missing_access_key() {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-secret-key", "secret456".parse().unwrap());
+
+        let result = metadata_creds(&req);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_metadata_creds_missing_secret_key() {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-access-key", "access123".parse().unwrap());
+
+        let result = metadata_creds(&req);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_metadata_creds_missing_both() {
+        let req = Request::new(());
+        let result = metadata_creds(&req);
+        assert_eq!(result, None);
+    }
+}

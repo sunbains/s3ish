@@ -1,85 +1,103 @@
-# mems3-grpc
+# s3ish
 
-A small **in-memory, S3-like object store** implemented in Rust with:
-
-- **gRPC transport** (connection management) via `tonic`
-- Pluggable **authentication** (file-based implementation provided)
-- Pluggable **storage** (in-memory BTreeMap/BTreeSet implementation provided)
-
-This is not the AWS S3 HTTP API; it's an S3-*style* object store exposed over gRPC
-(`CreateBucket`, `PutObject`, `GetObject`, etc.). It’s designed so you can swap the transport
-layer later if you want to add a real S3 REST API.
+In-memory S3-like object store with pluggable gRPC and HTTP interfaces.
 
 ## Features
 
-- Buckets + objects (`bucket/key`)
-- Deterministic listing order (BTreeMap)
-- ETag = MD5(data)
-- Metadata: content-type, size, last-modified
-- Auth enforced on every RPC via gRPC metadata headers
+- **Dual Protocol Support**: gRPC and S3-compatible HTTP APIs
+- **Pluggable Architecture**: Easy to swap authentication and storage backends
+- **In-Memory Storage**: Fast, ephemeral object storage
+- **File-Based Auth**: Simple access key/secret key authentication
+- **Comprehensive Tests**: 57 unit tests covering all components
 
-## Quickstart
-
-```bash
-# 1) Build
-cargo build
-
-# 2) Run (reads ./config.toml by default)
-RUST_LOG=info cargo run
-
-# Or specify config:
-MEMS3_CONFIG=./config.toml RUST_LOG=info cargo run
-```
-
-### Auth
-
-Provide credentials via **gRPC metadata**:
-
-- `x-access-key: <access_key>`
-- `x-secret-key: <secret_key>`
-
-Credentials come from `creds.txt` (see format below).
-
-`creds.txt` format:
-
-```
-# comments allowed
-access_key:secret_key
-demo:demo-secret
-```
-
-## Example client (grpcurl)
-
-If you have `grpcurl` installed:
+## Quick Start
 
 ```bash
-grpcurl -plaintext   -H 'x-access-key: demo'   -H 'x-secret-key: demo-secret'   -d '{"bucket":{"name":"b1"}}'   127.0.0.1:50051 mems3.v1.ObjectStore/CreateBucket
+# Build the project
+cargo build --release
+
+# Create credentials file
+echo "demo:demo-secret" > creds.txt
+
+# Run with HTTP protocol (listens on 0.0.0.0:9000)
+./target/release/s3ish --protocol http --listen 0.0.0.0:9000
+
+# Run with gRPC protocol
+./target/release/s3ish --protocol grpc --listen 0.0.0.0:50051
 ```
 
-Put object:
+## Command Line Options
 
-```bash
-grpcurl -plaintext   -H 'x-access-key: demo'   -H 'x-secret-key: demo-secret'   -d '{"object":{"bucket":"b1","key":"k1"}, "data":"aGVsbG8=", "content_type":"text/plain"}'   127.0.0.1:50051 mems3.v1.ObjectStore/PutObject
+```
+Usage: s3ish [OPTIONS]
+
+Options:
+  -l, --listen <LISTEN>        Address to listen on (e.g., 0.0.0.0:9000, 127.0.0.1:9000)
+  -p, --protocol <PROTOCOL>    Protocol to use (grpc or http) [default: grpc]
+  -c, --config <CONFIG>        Path to configuration file [default: config.toml]
+  -a, --auth-file <AUTH_FILE>  Path to credentials file
+  -h, --help                   Print help
 ```
 
-Get object:
+## Usage Examples
+
+### Create a bucket
 
 ```bash
-grpcurl -plaintext   -H 'x-access-key: demo'   -H 'x-secret-key: demo-secret'   -d '{"object":{"bucket":"b1","key":"k1"}}'   127.0.0.1:50051 mems3.v1.ObjectStore/GetObject
+curl -X PUT http://localhost:9000/my-bucket \
+  -H "x-access-key: demo" \
+  -H "x-secret-key: demo-secret"
+```
+
+### Upload an object
+
+```bash
+curl -X PUT http://localhost:9000/my-bucket/hello.txt \
+  -H "x-access-key: demo" \
+  -H "x-secret-key: demo-secret" \
+  -H "content-type: text/plain" \
+  -d "Hello, World!"
+```
+
+### Download an object
+
+```bash
+curl http://localhost:9000/my-bucket/hello.txt \
+  -H "x-access-key: demo" \
+  -H "x-secret-key: demo-secret"
+```
+
+### List objects
+
+```bash
+curl "http://localhost:9000/my-bucket/?prefix=&max-keys=100" \
+  -H "x-access-key: demo" \
+  -H "x-secret-key: demo-secret"
+```
+
+## Configuration
+
+Create a `config.toml` file:
+
+```toml
+listen_addr = "0.0.0.0:9000"
+auth_file = "./creds.txt"
 ```
 
 ## Architecture
 
-- `auth::Authenticator` — abstraction for authentication
-  - `auth::file_auth::FileAuthenticator` — concrete, file-based
-- `storage::StorageBackend` — abstraction for object storage
-  - `storage::in_memory::InMemoryStorage` — concrete, in-memory BTreeMap
-- `server::ConnectionManager` — abstraction for serving connections
-  - `server::GrpcConnectionManager` — concrete gRPC implementation
-- `service::ObjectStoreService` — message handling (business logic) wired to gRPC
+The project uses a pluggable architecture where protocol handlers (gRPC, HTTP) share common authentication and storage backends through the `BaseHandler`.
 
-## Notes / Extensions
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed documentation.
 
-- Add streaming upload/download RPCs for very large objects.
-- Add per-bucket ACLs in `AuthContext`.
-- Swap gRPC for a real S3 HTTP API while keeping `StorageBackend`.
+## Testing
+
+```bash
+cargo test
+```
+
+All 57 tests pass covering authentication, storage, gRPC, and HTTP handlers.
+
+## License
+
+MIT

@@ -1,7 +1,7 @@
-use mems3_grpc::auth::file_auth::FileAuthenticator;
-use mems3_grpc::storage::in_memory::InMemoryStorage;
-use mems3_grpc::storage::StorageBackend;
-use std::sync::Arc;
+use s3ish::auth::file_auth::FileAuthenticator;
+use s3ish::auth::Authenticator;
+use s3ish::storage::in_memory::InMemoryStorage;
+use s3ish::storage::StorageBackend;
 use tonic::Request;
 
 #[tokio::test]

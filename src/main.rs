@@ -1,10 +1,35 @@
-use mems3_grpc::auth::file_auth::FileAuthenticator;
-use mems3_grpc::config::Config;
-use mems3_grpc::server::{ConnectionManager, GrpcConnectionManager};
-use mems3_grpc::storage::in_memory::InMemoryStorage;
+use clap::Parser;
+use s3ish::auth::file_auth::FileAuthenticator;
+use s3ish::auth::Authenticator;
+use s3ish::config::Config;
+use s3ish::handler::BaseHandler;
+use s3ish::server::{ConnectionManager, GrpcConnectionManager, S3HttpConnectionManager};
+use s3ish::storage::in_memory::InMemoryStorage;
+use s3ish::storage::StorageBackend;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[command(name = "s3ish")]
+#[command(about = "In-memory S3-like object store with gRPC and HTTP interfaces", long_about = None)]
+struct Args {
+    /// Address to listen on (e.g., 0.0.0.0:9000, 127.0.0.1:9000)
+    #[arg(short, long)]
+    listen: Option<String>,
+
+    /// Protocol to use (grpc or http)
+    #[arg(short, long, default_value = "grpc")]
+    protocol: String,
+
+    /// Path to configuration file
+    #[arg(short, long, default_value = "config.toml")]
+    config: String,
+
+    /// Path to credentials file
+    #[arg(short, long)]
+    auth_file: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,28 +37,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let cfg_path = std::env::var("MEMS3_CONFIG").unwrap_or_else(|_| "config.toml".into());
-    let cfg = Config::from_path(&cfg_path)?;
+    let args = Args::parse();
 
-    let addr: SocketAddr = cfg.listen_addr.parse()?;
+    // Load config from file
+    let cfg = Config::from_path(&args.config)?;
 
-    let auth = Arc::new(FileAuthenticator::new(cfg.auth_file).await?);
-    let storage = Arc::new(InMemoryStorage::new());
+    // Command line args override config file
+    let addr: SocketAddr = args
+        .listen
+        .as_ref()
+        .unwrap_or(&cfg.listen_addr)
+        .parse()?;
 
-    let server = GrpcConnectionManager::new(auth, storage);
+    // Create shared components
+    let auth_file = args.auth_file.as_ref().unwrap_or(&cfg.auth_file);
+    let auth: Arc<dyn Authenticator> = Arc::new(FileAuthenticator::new(auth_file).await?);
+    let storage: Arc<dyn StorageBackend> = Arc::new(InMemoryStorage::new());
+    let handler = BaseHandler::new(auth, storage);
 
-    tracing::info!("mems3-grpc listening on {}", addr);
-    tracing::info!("auth via metadata headers: x-access-key / x-secret-key");
+    // Use protocol from command line args
+    let protocol = args.protocol.as_str();
 
-    // Serve until killed (Ctrl-C).
-    tokio::select! {
-        r = server.serve(addr) => {
-            if let Err(e) = r {
-                tracing::error!("server exited with error: {e}");
+    match protocol {
+        "http" | "s3" => {
+            let server = S3HttpConnectionManager::new(handler);
+            tracing::info!("s3ish HTTP server listening on {}", addr);
+            tracing::info!("auth via headers: x-access-key / x-secret-key (or x-amz-*)");
+
+            tokio::select! {
+                r = server.serve(addr) => {
+                    if let Err(e) = r {
+                        tracing::error!("server exited with error: {e}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("ctrl-c received, shutting down");
+                }
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::warn!("ctrl-c received, shutting down");
+        _ => {
+            let server = GrpcConnectionManager::new(handler);
+            tracing::info!("s3ish gRPC server listening on {}", addr);
+            tracing::info!("auth via metadata headers: x-access-key / x-secret-key");
+
+            tokio::select! {
+                r = server.serve(addr) => {
+                    if let Err(e) = r {
+                        tracing::error!("server exited with error: {e}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("ctrl-c received, shutting down");
+                }
+            }
         }
     }
 

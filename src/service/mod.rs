@@ -1,24 +1,24 @@
-use crate::auth::{AuthError, Authenticator};
+use crate::auth::AuthError;
+use crate::handler::BaseHandler;
 use crate::pb::{
     object_store_server::ObjectStore, CreateBucketRequest, CreateBucketResponse, DeleteBucketRequest,
     DeleteBucketResponse, DeleteObjectRequest, DeleteObjectResponse, GetObjectRequest,
     GetObjectResponse, ListObjectsRequest, ListObjectsResponse, ObjectInfo, PutObjectRequest,
     PutObjectResponse,
 };
-use crate::storage::{StorageBackend, StorageError};
+use crate::storage::StorageError;
 use prost_types::Timestamp;
-use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
+/// gRPC service implementation wrapping BaseHandler
 #[derive(Clone)]
-pub struct ObjectStoreService<A: Authenticator + Clone, S: StorageBackend + Clone> {
-    auth: Arc<A>,
-    storage: Arc<S>,
+pub struct ObjectStoreService {
+    handler: BaseHandler,
 }
 
-impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStoreService<A, S> {
-    pub fn new(auth: Arc<A>, storage: Arc<S>) -> Self {
-        Self { auth, storage }
+impl ObjectStoreService {
+    pub fn new(handler: BaseHandler) -> Self {
+        Self { handler }
     }
 
     async fn authenticate<T>(&self, req: &Request<T>) -> Result<(), Status> {
@@ -28,7 +28,8 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStoreService<A, 
         let mut dummy = Request::new(());
         *dummy.metadata_mut() = req.metadata().clone();
 
-        self.auth
+        self.handler
+            .auth
             .authenticate(&dummy)
             .await
             .map(|_ctx| ())
@@ -62,7 +63,7 @@ fn map_auth_err(e: AuthError) -> Status {
 }
 
 #[tonic::async_trait]
-impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for ObjectStoreService<A, S> {
+impl ObjectStore for ObjectStoreService {
     async fn create_bucket(
         &self,
         req: Request<CreateBucketRequest>,
@@ -74,7 +75,7 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
             .ok_or_else(|| Status::invalid_argument("bucket is required"))?
             .name;
 
-        let created = self.storage.create_bucket(&bucket).await.map_err(map_storage_err)?;
+        let created = self.handler.storage.create_bucket(&bucket).await.map_err(map_storage_err)?;
         Ok(Response::new(CreateBucketResponse { created }))
     }
 
@@ -89,7 +90,7 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
             .ok_or_else(|| Status::invalid_argument("bucket is required"))?
             .name;
 
-        let deleted = self.storage.delete_bucket(&bucket).await.map_err(map_storage_err)?;
+        let deleted = self.handler.storage.delete_bucket(&bucket).await.map_err(map_storage_err)?;
         Ok(Response::new(DeleteBucketResponse { deleted }))
     }
 
@@ -104,6 +105,7 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
             .ok_or_else(|| Status::invalid_argument("object is required"))?;
         let data = bytes::Bytes::from(inner.data);
         let meta = self
+            .handler
             .storage
             .put_object(&obj.bucket, &obj.key, data, &inner.content_type)
             .await
@@ -127,6 +129,7 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
             .ok_or_else(|| Status::invalid_argument("object is required"))?;
 
         let (data, meta) = self
+            .handler
             .storage
             .get_object(&obj.bucket, &obj.key)
             .await
@@ -151,6 +154,7 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
             .ok_or_else(|| Status::invalid_argument("object is required"))?;
 
         let deleted = self
+            .handler
             .storage
             .delete_object(&obj.bucket, &obj.key)
             .await
@@ -167,6 +171,7 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
 
         let limit = if inner.limit == 0 { 1000 } else { inner.limit as usize };
         let objs = self
+            .handler
             .storage
             .list_objects(&inner.bucket, &inner.prefix, limit)
             .await
@@ -184,5 +189,388 @@ impl<A: Authenticator + Clone, S: StorageBackend + Clone> ObjectStore for Object
             .collect();
 
         Ok(Response::new(ListObjectsResponse { objects }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AuthContext, AuthError, Authenticator};
+    use crate::pb::{BucketName, ObjectKey};
+    use crate::storage::in_memory::InMemoryStorage;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct MockAuthenticator {
+        should_fail: bool,
+    }
+
+    #[async_trait]
+    impl Authenticator for MockAuthenticator {
+        async fn authenticate(&self, req: &Request<()>) -> Result<AuthContext, AuthError> {
+            if self.should_fail {
+                return Err(AuthError::InvalidCredentials);
+            }
+            // Check for required metadata
+            if req.metadata().get("x-access-key").is_none() {
+                return Err(AuthError::MissingCredentials);
+            }
+            Ok(AuthContext {
+                access_key: "test-user".to_string(),
+            })
+        }
+    }
+
+    fn create_test_service(auth_should_fail: bool) -> ObjectStoreService {
+        let auth: Arc<dyn Authenticator> = Arc::new(MockAuthenticator {
+            should_fail: auth_should_fail,
+        });
+        let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(InMemoryStorage::new());
+        let handler = BaseHandler::new(auth, storage);
+        ObjectStoreService::new(handler)
+    }
+
+    fn create_authenticated_request<T>(inner: T) -> Request<T> {
+        let mut req = Request::new(inner);
+        req.metadata_mut()
+            .insert("x-access-key", "test-user".parse().unwrap());
+        req.metadata_mut()
+            .insert("x-secret-key", "test-pass".parse().unwrap());
+        req
+    }
+
+    #[tokio::test]
+    async fn test_service_create_bucket_success() {
+        let service = create_test_service(false);
+        let req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+
+        let response = service.create_bucket(req).await.unwrap();
+        assert!(response.into_inner().created);
+    }
+
+    #[tokio::test]
+    async fn test_service_create_bucket_unauthenticated() {
+        let service = create_test_service(false);
+        let req = Request::new(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+
+        let result = service.create_bucket(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn test_service_create_bucket_auth_failed() {
+        let service = create_test_service(true);
+        let req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+
+        let result = service.create_bucket(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn test_service_create_bucket_missing_name() {
+        let service = create_test_service(false);
+        let req = create_authenticated_request(CreateBucketRequest { bucket: None });
+
+        let result = service.create_bucket(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_service_delete_bucket_success() {
+        let service = create_test_service(false);
+
+        // First create a bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Then delete it
+        let delete_req = create_authenticated_request(DeleteBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        let response = service.delete_bucket(delete_req).await.unwrap();
+        assert!(response.into_inner().deleted);
+    }
+
+    #[tokio::test]
+    async fn test_service_put_object_success() {
+        let service = create_test_service(false);
+
+        // Create bucket first
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Put object
+        let put_req = create_authenticated_request(PutObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "test-bucket".to_string(),
+                key: "test-key".to_string(),
+            }),
+            data: b"test data".to_vec(),
+            content_type: "text/plain".to_string(),
+        });
+
+        let response = service.put_object(put_req).await.unwrap();
+        let inner = response.into_inner();
+        assert_eq!(inner.size, 9);
+        assert!(!inner.etag.is_empty());
+        assert!(inner.last_modified.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_service_put_object_missing_object() {
+        let service = create_test_service(false);
+        let req = create_authenticated_request(PutObjectRequest {
+            object: None,
+            data: b"test data".to_vec(),
+            content_type: "text/plain".to_string(),
+        });
+
+        let result = service.put_object(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_service_get_object_success() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Put object
+        let put_req = create_authenticated_request(PutObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "test-bucket".to_string(),
+                key: "test-key".to_string(),
+            }),
+            data: b"test data".to_vec(),
+            content_type: "text/plain".to_string(),
+        });
+        service.put_object(put_req).await.unwrap();
+
+        // Get object
+        let get_req = create_authenticated_request(GetObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "test-bucket".to_string(),
+                key: "test-key".to_string(),
+            }),
+        });
+
+        let response = service.get_object(get_req).await.unwrap();
+        let inner = response.into_inner();
+        assert_eq!(inner.data, b"test data");
+        assert_eq!(inner.content_type, "text/plain");
+        assert!(!inner.etag.is_empty());
+        assert!(inner.last_modified.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_service_get_object_not_found() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Try to get non-existent object
+        let get_req = create_authenticated_request(GetObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "test-bucket".to_string(),
+                key: "nonexistent".to_string(),
+            }),
+        });
+
+        let result = service.get_object(get_req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_service_delete_object_success() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Put object
+        let put_req = create_authenticated_request(PutObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "test-bucket".to_string(),
+                key: "test-key".to_string(),
+            }),
+            data: b"test data".to_vec(),
+            content_type: "text/plain".to_string(),
+        });
+        service.put_object(put_req).await.unwrap();
+
+        // Delete object
+        let delete_req = create_authenticated_request(DeleteObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "test-bucket".to_string(),
+                key: "test-key".to_string(),
+            }),
+        });
+
+        let response = service.delete_object(delete_req).await.unwrap();
+        assert!(response.into_inner().deleted);
+    }
+
+    #[tokio::test]
+    async fn test_service_list_objects_empty() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // List objects
+        let list_req = create_authenticated_request(ListObjectsRequest {
+            bucket: "test-bucket".to_string(),
+            prefix: "".to_string(),
+            limit: 100,
+        });
+
+        let response = service.list_objects(list_req).await.unwrap();
+        let inner = response.into_inner();
+        assert!(inner.objects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_service_list_objects_with_data() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Put multiple objects
+        for i in 1..=3 {
+            let put_req = create_authenticated_request(PutObjectRequest {
+                object: Some(ObjectKey {
+                    bucket: "test-bucket".to_string(),
+                    key: format!("key{}", i),
+                }),
+                data: format!("data{}", i).into_bytes(),
+                content_type: "text/plain".to_string(),
+            });
+            service.put_object(put_req).await.unwrap();
+        }
+
+        // List objects
+        let list_req = create_authenticated_request(ListObjectsRequest {
+            bucket: "test-bucket".to_string(),
+            prefix: "".to_string(),
+            limit: 100,
+        });
+
+        let response = service.list_objects(list_req).await.unwrap();
+        let inner = response.into_inner();
+        assert_eq!(inner.objects.len(), 3);
+        assert_eq!(inner.objects[0].key, "key1");
+        assert_eq!(inner.objects[1].key, "key2");
+        assert_eq!(inner.objects[2].key, "key3");
+    }
+
+    #[tokio::test]
+    async fn test_service_list_objects_with_prefix() {
+        let service = create_test_service(false);
+
+        // Create bucket
+        let create_req = create_authenticated_request(CreateBucketRequest {
+            bucket: Some(BucketName {
+                name: "test-bucket".to_string(),
+            }),
+        });
+        service.create_bucket(create_req).await.unwrap();
+
+        // Put objects with different prefixes
+        for key in ["photos/1.jpg", "photos/2.jpg", "docs/readme.txt"] {
+            let put_req = create_authenticated_request(PutObjectRequest {
+                object: Some(ObjectKey {
+                    bucket: "test-bucket".to_string(),
+                    key: key.to_string(),
+                }),
+                data: b"data".to_vec(),
+                content_type: "text/plain".to_string(),
+            });
+            service.put_object(put_req).await.unwrap();
+        }
+
+        // List with prefix
+        let list_req = create_authenticated_request(ListObjectsRequest {
+            bucket: "test-bucket".to_string(),
+            prefix: "photos/".to_string(),
+            limit: 100,
+        });
+
+        let response = service.list_objects(list_req).await.unwrap();
+        let inner = response.into_inner();
+        assert_eq!(inner.objects.len(), 2);
+        assert!(inner.objects[0].key.starts_with("photos/"));
+        assert!(inner.objects[1].key.starts_with("photos/"));
+    }
+
+    #[tokio::test]
+    async fn test_service_error_mapping() {
+        let service = create_test_service(false);
+
+        // Test bucket not found
+        let get_req = create_authenticated_request(GetObjectRequest {
+            object: Some(ObjectKey {
+                bucket: "nonexistent".to_string(),
+                key: "key".to_string(),
+            }),
+        });
+        let result = service.get_object(get_req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
     }
 }

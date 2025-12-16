@@ -56,8 +56,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => Arc::new(InMemoryStorage::new()),
     };
-    let handler = BaseHandler::new(auth, storage);
+    let handler = BaseHandler::new(auth, storage.clone());
     let response_ctx = ResponseContext::new(cfg.region.clone(), cfg.request_id_prefix.clone());
+
+    // Start lifecycle executor if enabled
+    if cfg.lifecycle.enabled {
+        use s3ish::storage::lifecycle_executor::LifecycleExecutor;
+
+        let lifecycle_config = s3ish::storage::lifecycle_executor::LifecycleConfig {
+            enabled: cfg.lifecycle.enabled,
+            check_interval_secs: cfg.lifecycle.check_interval_secs,
+            max_concurrent_deletes: cfg.lifecycle.max_concurrent_deletes,
+        };
+
+        let executor = LifecycleExecutor::new(storage.clone(), lifecycle_config);
+        let _lifecycle_handle = executor.spawn();
+
+        tracing::info!(
+            "Lifecycle executor started (check interval: {}s)",
+            cfg.lifecycle.check_interval_secs
+        );
+    } else {
+        tracing::info!("Lifecycle executor disabled");
+    }
 
     // Use protocol from command line args
     let protocol = args.protocol.as_str();

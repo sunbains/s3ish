@@ -18,6 +18,9 @@ pub struct Config {
 
     #[serde(default)]
     pub storage: StorageConfig,
+
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,6 +38,31 @@ impl Default for StorageConfig {
         Self {
             backend: default_backend(),
             path: default_path(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LifecycleConfig {
+    /// Whether lifecycle execution is enabled
+    #[serde(default = "default_lifecycle_enabled")]
+    pub enabled: bool,
+
+    /// Interval between lifecycle policy checks (in seconds)
+    #[serde(default = "default_lifecycle_interval")]
+    pub check_interval_secs: u64,
+
+    /// Maximum number of objects to delete concurrently
+    #[serde(default = "default_max_concurrent_deletes")]
+    pub max_concurrent_deletes: usize,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_lifecycle_enabled(),
+            check_interval_secs: default_lifecycle_interval(),
+            max_concurrent_deletes: default_max_concurrent_deletes(),
         }
     }
 }
@@ -61,4 +89,16 @@ fn default_backend() -> String {
 
 fn default_path() -> String {
     "./data".to_string()
+}
+
+fn default_lifecycle_enabled() -> bool {
+    true
+}
+
+fn default_lifecycle_interval() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_max_concurrent_deletes() -> usize {
+    100
 }

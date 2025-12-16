@@ -1,5 +1,6 @@
 use crate::auth::AuthError;
 use crate::handler::BaseHandler;
+use crate::observability::{health, metrics};
 use crate::storage::StorageError;
 use axum::{
     body::Body,
@@ -121,6 +122,18 @@ impl S3State {
                 parts: HashMap::new(),
             },
         );
+
+        // Record multipart metrics
+        metrics::increment_multipart_init();
+        metrics::inc_multipart_active();
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            "Multipart upload initiated"
+        );
+
         Ok(upload_id)
     }
 
@@ -132,6 +145,8 @@ impl S3State {
         part_number: u32,
         body: &[u8],
     ) -> Result<String, S3Error> {
+        let start_time = std::time::Instant::now();
+
         let mut map = self.multipart_uploads.lock().await;
         let entry = map
             .get_mut(upload_id)
@@ -153,6 +168,22 @@ impl S3State {
                 data: Bytes::copy_from_slice(body),
             },
         );
+
+        // Record multipart part metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_multipart_part_duration(duration);
+        metrics::record_multipart_part_size(body.len());
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            part_number = part_number,
+            size = body.len(),
+            duration_ms = duration * 1000.0,
+            "Multipart part uploaded"
+        );
+
         Ok(etag)
     }
 
@@ -163,6 +194,8 @@ impl S3State {
         upload_id: &str,
         requested_parts: Option<Vec<(u32, String)>>,
     ) -> Result<String, S3Error> {
+        let start_time = std::time::Instant::now();
+
         let mut map = self.multipart_uploads.lock().await;
         let entry = map.remove(upload_id).ok_or_else(|| S3Error::NoSuchUpload {
             bucket: bucket.to_string(),
@@ -203,6 +236,7 @@ impl S3State {
 
         let mut ordered = parts;
         ordered.sort_by_key(|(n, _)| *n);
+        let parts_count = ordered.len();
         let mut buf = BytesMut::new();
         for (_, part) in ordered {
             buf.extend_from_slice(&part.data);
@@ -219,18 +253,46 @@ impl S3State {
                 HashMap::new(),
             )
             .await?;
+
+        // Record multipart completion metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_multipart_complete_duration(duration);
+        metrics::dec_multipart_active();
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            parts_count = parts_count,
+            duration_ms = (duration * 1000.0) as u64,
+            "multipart upload completed"
+        );
+
         Ok(meta.etag)
     }
 
     async fn abort_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), S3Error> {
         let mut map = self.multipart_uploads.lock().await;
-        match map.remove(upload_id) {
-            Some(entry) if entry.bucket == bucket && entry.key == key => Ok(()),
+        let result = match map.remove(upload_id) {
+            Some(entry) if entry.bucket == bucket && entry.key == key => {
+                // Decrement active uploads when aborting
+                metrics::dec_multipart_active();
+
+                tracing::debug!(
+                    bucket = %bucket,
+                    key = %key,
+                    upload_id = %upload_id,
+                    "multipart upload aborted"
+                );
+
+                Ok(())
+            }
             _ => Err(S3Error::NoSuchUpload {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             }),
-        }
+        };
+        result
     }
 }
 
@@ -265,6 +327,11 @@ impl S3HttpHandler {
     /// Create the router for S3 HTTP API
     pub fn router(self) -> Router {
         Router::new()
+            // Observability endpoints
+            .route("/_metrics", get(metrics_endpoint))
+            .route("/_health", get(health_endpoint))
+            .route("/_ready", get(ready_endpoint))
+            // S3 API routes
             .route("/", get(list_buckets))
             .route(
                 "/:bucket",
@@ -306,6 +373,8 @@ impl S3HttpHandler {
         }
 
         // Legacy header-based auth (for simple testing or gRPC parity)
+        let auth_start = std::time::Instant::now();
+
         let access_key = headers
             .get("x-amz-access-key")
             .or_else(|| headers.get("x-access-key"))
@@ -326,7 +395,8 @@ impl S3HttpHandler {
         req.metadata_mut()
             .insert("x-secret-key", secret_key.parse().unwrap());
 
-        self.state
+        let result = self
+            .state
             .handler
             .auth
             .authenticate(&req)
@@ -336,7 +406,17 @@ impl S3HttpHandler {
                 AuthError::MissingCredentials => S3Error::MissingCredentials,
                 AuthError::InvalidCredentials => S3Error::InvalidCredentials,
                 AuthError::Internal(msg) => S3Error::Internal(msg),
-            })
+            });
+
+        // Record auth metrics
+        metrics::record_auth_duration("header", auth_start.elapsed().as_secs_f64());
+        if result.is_ok() {
+            metrics::increment_auth_success("header");
+        } else {
+            metrics::increment_auth_failure("header");
+        }
+
+        result
     }
 
     async fn verify_sigv4(
@@ -347,8 +427,15 @@ impl S3HttpHandler {
         payload: &[u8],
         auth_header: &str,
     ) -> Result<(), S3Error> {
-        let parsed = parse_sigv4_authorization(auth_header)?;
+        let overall_start = std::time::Instant::now();
 
+        // Stage 1: Parse authorization header
+        let parse_start = std::time::Instant::now();
+        let parsed = parse_sigv4_authorization(auth_header)?;
+        metrics::record_sigv4_stage("parse", parse_start.elapsed().as_secs_f64());
+
+        // Stage 2: Extract and validate headers
+        let headers_start = std::time::Instant::now();
         let amz_date = headers
             .get("x-amz-date")
             .ok_or(S3Error::MissingCredentials)?
@@ -373,16 +460,25 @@ impl S3HttpHandler {
             }
             None => computed_payload_hash,
         };
+        metrics::record_sigv4_stage("headers", headers_start.elapsed().as_secs_f64());
 
+        // Stage 3: Build canonical request
+        let canonical_start = std::time::Instant::now();
         let canonical_request =
             build_canonical_request(method, uri, headers, &parsed.signed_headers, &payload_hash)?;
         let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+        metrics::record_sigv4_stage("canonical", canonical_start.elapsed().as_secs_f64());
 
+        // Stage 4: Build string to sign
+        let sign_build_start = std::time::Instant::now();
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}/{}/{}/aws4_request\n{}",
             amz_date, parsed.date, parsed.region, parsed.service, canonical_request_hash
         );
+        metrics::record_sigv4_stage("string_to_sign", sign_build_start.elapsed().as_secs_f64());
 
+        // Stage 5: Get secret and compute signature
+        let sign_start = std::time::Instant::now();
         let secret = self
             .state
             .handler
@@ -392,10 +488,20 @@ impl S3HttpHandler {
             .map_err(|_| S3Error::InvalidCredentials)?;
         let sig = sign_string(&secret, &parsed, &string_to_sign)?;
         let computed_signature = hex::encode(sig);
+        metrics::record_sigv4_stage("sign", sign_start.elapsed().as_secs_f64());
 
+        // Stage 6: Verify signature
+        let verify_start = std::time::Instant::now();
         if computed_signature != parsed.signature {
+            metrics::record_sigv4_stage("verify", verify_start.elapsed().as_secs_f64());
+            metrics::increment_auth_failure("sigv4");
             return Err(S3Error::InvalidCredentials);
         }
+        metrics::record_sigv4_stage("verify", verify_start.elapsed().as_secs_f64());
+
+        // Record overall auth duration and success
+        metrics::record_auth_duration("sigv4", overall_start.elapsed().as_secs_f64());
+        metrics::increment_auth_success("sigv4");
 
         Ok(())
     }
@@ -1746,6 +1852,44 @@ async fn list_objects(
         .renderer
         .list_objects(&bucket, &params.prefix, limit, &entries);
     Ok(attach_common_headers(resp, &state))
+}
+
+// ============================================================================
+// Observability Endpoints
+// ============================================================================
+
+/// Prometheus metrics endpoint
+async fn metrics_endpoint() -> impl IntoResponse {
+    let output = metrics::gather_metrics();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Body::from(output))
+        .unwrap()
+}
+
+/// Liveness probe - returns 200 if server is running
+async fn health_endpoint() -> impl IntoResponse {
+    let response = serde_json::json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+
+    (StatusCode::OK, axum::Json(response))
+}
+
+/// Readiness probe - checks backend health
+async fn ready_endpoint(State(state): State<S3State>) -> impl IntoResponse {
+    let health_status = health::get_health_status(&state.handler.storage, &state.handler.auth).await;
+
+    let status_code = if health_status.status == "healthy" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status_code, axum::Json(health_status))
 }
 
 #[cfg(test)]

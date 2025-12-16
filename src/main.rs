@@ -3,6 +3,7 @@ use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
 use s3ish::config::Config;
 use s3ish::handler::BaseHandler;
+use s3ish::observability::tracing_setup;
 use s3ish::s3_http::ResponseContext;
 use s3ish::server::{ConnectionManager, GrpcConnectionManager, S3HttpConnectionManager};
 use s3ish::storage::file_storage::FileStorage;
@@ -10,7 +11,6 @@ use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "s3ish")]
@@ -35,9 +35,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Initialize tracing with format from environment
+    tracing_setup::init_tracing_from_env();
 
     let args = Args::parse();
 

@@ -1,3 +1,4 @@
+use crate::observability::metrics;
 use crate::storage::StorageError;
 
 /// Very small XOR-based erasure helper that simulates data+parity shards.
@@ -26,6 +27,8 @@ impl Erasure {
     }
 
     pub fn encode(&self, data: &[u8]) -> Result<(Vec<Vec<u8>>, usize), StorageError> {
+        let start_time = std::time::Instant::now();
+
         if data.is_empty() {
             return Err(StorageError::InvalidInput("data cannot be empty".into()));
         }
@@ -51,6 +54,19 @@ impl Erasure {
             }
         }
 
+        // Record metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_erasure_encode(self.data_blocks, self.parity_blocks, duration);
+        metrics::increment_erasure_bytes("encode", data.len() as u64);
+
+        tracing::debug!(
+            data_blocks = self.data_blocks,
+            parity_blocks = self.parity_blocks,
+            input_bytes = data.len(),
+            duration_ms = duration * 1000.0,
+            "Erasure encoding completed"
+        );
+
         Ok((shards, data.len()))
     }
 
@@ -59,6 +75,8 @@ impl Erasure {
         shards: &mut [Option<Vec<u8>>],
         orig_len: usize,
     ) -> Result<Vec<u8>, StorageError> {
+        let start_time = std::time::Instant::now();
+
         if shards.len() < self.data_blocks + 1 {
             return Err(StorageError::InvalidInput("not enough shards".into()));
         }
@@ -109,6 +127,21 @@ impl Erasure {
             out.extend_from_slice(shard);
         }
         out.truncate(orig_len);
+
+        // Record metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_erasure_decode(self.data_blocks, self.parity_blocks, duration);
+        metrics::increment_erasure_bytes("decode", orig_len as u64);
+
+        tracing::debug!(
+            data_blocks = self.data_blocks,
+            parity_blocks = self.parity_blocks,
+            output_bytes = orig_len,
+            missing_shards = missing,
+            duration_ms = duration * 1000.0,
+            "Erasure decoding completed"
+        );
+
         Ok(out)
     }
 }

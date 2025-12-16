@@ -1,3 +1,4 @@
+use crate::observability::metrics;
 use crate::storage::common::{validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
 use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
@@ -160,6 +161,7 @@ impl StorageBackend for FileStorage {
         }
     }
 
+    #[tracing::instrument(skip(self, data, metadata), fields(bucket = %bucket, key = %key, size = data.len()))]
     async fn put_object(
         &self,
         bucket: &str,
@@ -168,6 +170,8 @@ impl StorageBackend for FileStorage {
         content_type: &str,
         metadata: HashMap<String, String>,
     ) -> Result<ObjectMetadata, StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
         if content_type.is_empty() {
@@ -176,10 +180,14 @@ impl StorageBackend for FileStorage {
             ));
         }
 
+        // Measure filesystem check latency
+        let fs_check_start = std::time::Instant::now();
         let bucket_path = self.bucket_path(bucket);
         if fs::metadata(&bucket_path).await.is_err() {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
+        let fs_check_duration = fs_check_start.elapsed().as_secs_f64();
+        tracing::debug!(fs_check_ms = fs_check_duration * 1000.0, "Bucket existence check");
 
         let obj_path = self.object_path(bucket, key);
         if let Some(parent) = obj_path.parent() {
@@ -274,18 +282,36 @@ impl StorageBackend for FileStorage {
             .await
             .map_err(|e| StorageError::Internal(format!("write meta: {e}")))?;
 
+        // Record overall operation metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("put", "file", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            size = size,
+            duration_ms = duration * 1000.0,
+            "FileStorage put object completed"
+        );
+
         Ok(to_object_metadata(stored_meta))
     }
 
+    #[tracing::instrument(skip(self), fields(bucket = %bucket, key = %key))]
     async fn get_object(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<(Bytes, ObjectMetadata), StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
         let obj_path = self.object_path(bucket, key);
         let meta_path = self.meta_path(&obj_path);
+
+        // Measure filesystem metadata read
+        let meta_read_start = std::time::Instant::now();
         let stored = read_stored_meta(&meta_path).await.map_err(|e| match e {
             StorageError::ObjectNotFound { .. } => StorageError::ObjectNotFound {
                 bucket: bucket.to_string(),
@@ -293,6 +319,7 @@ impl StorageBackend for FileStorage {
             },
             other => other,
         })?;
+        tracing::debug!(meta_read_ms = meta_read_start.elapsed().as_secs_f64() * 1000.0, "Metadata read");
         let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
             let shard_dir = self.shard_dir(&obj_path);
             let total = db + pb.max(1);
@@ -383,10 +410,26 @@ impl StorageBackend for FileStorage {
                 _ => StorageError::Internal(format!("read object: {e}")),
             })?
         };
+
+        // Record overall operation metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("get", "file", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            size = data.len(),
+            duration_ms = duration * 1000.0,
+            "FileStorage get object completed"
+        );
+
         Ok((Bytes::from(data), to_object_metadata(stored)))
     }
 
+    #[tracing::instrument(skip(self), fields(bucket = %bucket, key = %key))]
     async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
         let obj_path = self.object_path(bucket, key);
@@ -398,10 +441,24 @@ impl StorageBackend for FileStorage {
             },
             other => other,
         })?;
+
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("head", "file", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            duration_ms = (duration * 1000.0) as u64,
+            "head object completed"
+        );
+
         Ok(to_object_metadata(stored))
     }
 
+    #[tracing::instrument(skip(self), fields(bucket = %bucket, key = %key))]
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
         let obj_path = self.object_path(bucket, key);
@@ -414,15 +471,30 @@ impl StorageBackend for FileStorage {
         };
         let _ = remove_dir_all(&shard_dir).await;
         let meta_deleted = fs::remove_file(&meta_path).await.is_ok();
+
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("delete", "file", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            deleted = obj_deleted || meta_deleted,
+            duration_ms = (duration * 1000.0) as u64,
+            "delete object completed"
+        );
+
         Ok(obj_deleted || meta_deleted)
     }
 
+    #[tracing::instrument(skip(self), fields(bucket = %bucket, prefix = %prefix, limit = limit))]
     async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, ObjectMetadata)>, StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         let bucket_path = self.bucket_path(bucket);
         if fs::metadata(&bucket_path).await.is_err() {
@@ -492,6 +564,17 @@ impl StorageBackend for FileStorage {
                 }
             }
         }
+
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("list", "file", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            prefix = %prefix,
+            count = out.len(),
+            duration_ms = (duration * 1000.0) as u64,
+            "list objects completed"
+        );
 
         Ok(out)
     }

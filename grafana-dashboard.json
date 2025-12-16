@@ -1,0 +1,399 @@
+{
+  "dashboard": {
+    "title": "s3ish Observability Dashboard",
+    "tags": ["s3", "object-storage", "observability"],
+    "timezone": "browser",
+    "editable": true,
+    "graphTooltip": 1,
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "title": "Request Rate (HTTP)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}} ({{status}})"
+          }
+        ],
+        "yaxes": [
+          {"format": "reqps", "label": "Requests/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Request Rate (gRPC)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "rate(grpc_requests_total[5m])",
+            "legendFormat": "{{method}} ({{status}})"
+          }
+        ],
+        "yaxes": [
+          {"format": "reqps", "label": "Requests/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "HTTP Request Latency (P50, P95, P99)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P99"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "gRPC Request Latency (P50, P95, P99)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(grpc_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50 - {{method}}"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(grpc_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 - {{method}}"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(grpc_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P99 - {{method}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Authentication Duration by Type",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(auth_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 - {{auth_type}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Authentication Success Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [
+          {
+            "expr": "rate(auth_total{result=\"success\"}[5m]) / rate(auth_total[5m])",
+            "legendFormat": "{{auth_type}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "percentunit", "label": "Success Rate", "max": 1},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "SigV4 Stage Breakdown (P95)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(sigv4_stage_duration_seconds_bucket{stage=\"parse\"}[5m]))",
+            "legendFormat": "Parse"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(sigv4_stage_duration_seconds_bucket{stage=\"headers\"}[5m]))",
+            "legendFormat": "Headers"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(sigv4_stage_duration_seconds_bucket{stage=\"canonical\"}[5m]))",
+            "legendFormat": "Canonical Request"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(sigv4_stage_duration_seconds_bucket{stage=\"string_to_sign\"}[5m]))",
+            "legendFormat": "String to Sign"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(sigv4_stage_duration_seconds_bucket{stage=\"sign\"}[5m]))",
+            "legendFormat": "Sign"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(sigv4_stage_duration_seconds_bucket{stage=\"verify\"}[5m]))",
+            "legendFormat": "Verify"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Storage Operation Latency by Backend",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(storage_operation_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{operation}} - {{backend}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Latency"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Lock Wait Duration (P99)",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(storage_lock_wait_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{lock_type}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Wait Duration"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "name": "High Lock Contention",
+          "conditions": [
+            {
+              "evaluator": {"params": [0.01], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "message": "Lock contention is high - P99 wait time > 10ms"
+        }
+      },
+      {
+        "title": "Storage Objects Total",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+        "targets": [
+          {
+            "expr": "storage_objects_total",
+            "legendFormat": "{{bucket}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Objects"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Storage Bytes Total",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+        "targets": [
+          {
+            "expr": "storage_bytes_total",
+            "legendFormat": "{{bucket}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Bytes"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Erasure Coding Performance",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(erasure_encode_duration_seconds_bucket[5m]))",
+            "legendFormat": "Encode P95"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(erasure_decode_duration_seconds_bucket[5m]))",
+            "legendFormat": "Decode P95"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Erasure Coding Throughput",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 48},
+        "targets": [
+          {
+            "expr": "rate(erasure_bytes_processed_total[5m])",
+            "legendFormat": "{{operation}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "Bps", "label": "Bytes/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Multipart Upload Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 56},
+        "targets": [
+          {
+            "expr": "rate(multipart_init_total[5m])",
+            "legendFormat": "Initiations/sec"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Operations/sec"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Active Multipart Uploads",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 56},
+        "targets": [
+          {
+            "expr": "multipart_active_uploads",
+            "legendFormat": "Active Uploads"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Count"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Multipart Upload Latency",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 64},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(multipart_upload_part_duration_seconds_bucket[5m]))",
+            "legendFormat": "Part Upload P95"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(multipart_complete_duration_seconds_bucket[5m]))",
+            "legendFormat": "Complete P95"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Duration"},
+          {"format": "short"}
+        ]
+      },
+      {
+        "title": "Multipart Part Size Distribution",
+        "type": "heatmap",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 64},
+        "targets": [
+          {
+            "expr": "rate(multipart_part_size_bytes_bucket[5m])",
+            "format": "heatmap",
+            "legendFormat": "{{le}}"
+          }
+        ],
+        "yAxis": {
+          "format": "bytes"
+        }
+      },
+      {
+        "title": "Error Rate by Type",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 72},
+        "targets": [
+          {
+            "expr": "rate(error_total[5m])",
+            "legendFormat": "{{error_type}} ({{component}})"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Errors/sec"},
+          {"format": "short"}
+        ],
+        "alert": {
+          "name": "High Error Rate",
+          "conditions": [
+            {
+              "evaluator": {"params": [1], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "message": "Error rate is elevated - > 1 error/sec"
+        }
+      },
+      {
+        "title": "Concurrent Requests",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 72},
+        "targets": [
+          {
+            "expr": "concurrent_requests",
+            "legendFormat": "{{protocol}}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Concurrent Requests"},
+          {"format": "short"}
+        ]
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus",
+          "current": {
+            "text": "Prometheus",
+            "value": "Prometheus"
+          }
+        }
+      ]
+    },
+    "annotations": {
+      "list": [
+        {
+          "datasource": "Prometheus",
+          "enable": true,
+          "expr": "changes(process_start_time_seconds[5m]) > 0",
+          "iconColor": "rgba(255, 96, 96, 1)",
+          "name": "Service Restarts",
+          "tagKeys": "service"
+        }
+      ]
+    },
+    "refresh": "10s",
+    "schemaVersion": 27,
+    "version": 1
+  },
+  "overwrite": true
+}

@@ -1,3 +1,4 @@
+use crate::observability::metrics;
 use crate::storage::common::{compute_etag, validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
 use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
@@ -73,6 +74,7 @@ impl StorageBackend for InMemoryStorage {
         Ok(b.remove(bucket))
     }
 
+    #[tracing::instrument(skip(self, data, metadata), fields(bucket = %bucket, key = %key, size = data.len()))]
     async fn put_object(
         &self,
         bucket: &str,
@@ -81,6 +83,8 @@ impl StorageBackend for InMemoryStorage {
         content_type: &str,
         metadata: HashMap<String, String>,
     ) -> Result<ObjectMetadata, StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
         if content_type.is_empty() {
@@ -89,9 +93,12 @@ impl StorageBackend for InMemoryStorage {
             ));
         }
 
-        // bucket must exist
+        // bucket must exist - measure lock wait
         {
+            let lock_start = std::time::Instant::now();
             let b = self.buckets.read().await;
+            metrics::record_lock_wait("bucket_read", lock_start.elapsed().as_secs_f64());
+
             if !b.contains(bucket) {
                 return Err(StorageError::BucketNotFound(bucket.to_string()));
             }
@@ -110,7 +117,11 @@ impl StorageBackend for InMemoryStorage {
             metadata,
         };
 
+        // measure lock wait for write
+        let lock_start = std::time::Instant::now();
         let mut objs = self.objects.write().await;
+        metrics::record_lock_wait("object_write", lock_start.elapsed().as_secs_f64());
+
         objs.insert(
             (bucket.to_string(), key.to_string()),
             StoredObject {
@@ -119,17 +130,38 @@ impl StorageBackend for InMemoryStorage {
                 meta: meta.clone(),
             },
         );
+
+        // Record overall operation metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("put", "memory", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            size = size,
+            duration_ms = duration * 1000.0,
+            "Put object completed"
+        );
+
         Ok(meta)
     }
 
+    #[tracing::instrument(skip(self), fields(bucket = %bucket, key = %key))]
     async fn get_object(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<(Bytes, ObjectMetadata), StorageError> {
+        let start_time = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
+
+        // Measure lock wait for read
+        let lock_start = std::time::Instant::now();
         let objs = self.objects.read().await;
+        metrics::record_lock_wait("object_read", lock_start.elapsed().as_secs_f64());
+
         let obj = objs
             .get(&(bucket.to_string(), key.to_string()))
             .ok_or_else(|| StorageError::ObjectNotFound {
@@ -139,6 +171,19 @@ impl StorageBackend for InMemoryStorage {
         let mut shards: Vec<Option<Vec<u8>>> =
             obj.shards.iter().map(|c| Some(c.to_vec())).collect();
         let data = self.erasure.decode(&mut shards, obj.orig_len)?;
+
+        // Record overall operation metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        metrics::record_storage_op("get", "memory", duration);
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            size = data.len(),
+            duration_ms = duration * 1000.0,
+            "Get object completed"
+        );
+
         Ok((Bytes::from(data), obj.meta.clone()))
     }
 

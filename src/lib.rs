@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod handler;
+pub mod observability;
 pub mod pb;
 pub mod s3_http;
 pub mod server;

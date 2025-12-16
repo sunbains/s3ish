@@ -1,5 +1,6 @@
 use crate::auth::AuthError;
 use crate::handler::BaseHandler;
+use crate::observability::metrics;
 use crate::pb::{
     object_store_server::ObjectStore, CreateBucketRequest, CreateBucketResponse,
     DeleteBucketRequest, DeleteBucketResponse, DeleteObjectRequest, DeleteObjectResponse,
@@ -108,36 +109,50 @@ impl ObjectStore for ObjectStoreService {
         Ok(Response::new(DeleteBucketResponse { deleted }))
     }
 
+    #[tracing::instrument(skip(self, req), fields(method = "put_object"))]
     async fn put_object(
         &self,
         req: Request<PutObjectRequest>,
     ) -> Result<Response<PutObjectResponse>, Status> {
-        self.authenticate(&req).await?;
-        let inner = req.into_inner();
-        let obj = inner
-            .object
-            .ok_or_else(|| Status::invalid_argument("object is required"))?;
-        let data = bytes::Bytes::from(inner.data);
-        let metadata = inner.metadata;
-        let meta = self
-            .handler
-            .storage
-            .put_object(
-                &obj.bucket,
-                &obj.key,
-                data,
-                &inner.content_type,
-                metadata.clone(),
-            )
-            .await
-            .map_err(map_storage_err)?;
+        let start_time = std::time::Instant::now();
 
-        Ok(Response::new(PutObjectResponse {
-            etag: meta.etag,
-            size: meta.size,
-            last_modified: Some(ts_from_unix_secs(meta.last_modified_unix_secs)),
-            metadata,
-        }))
+        let result = async {
+            self.authenticate(&req).await?;
+            let inner = req.into_inner();
+            let obj = inner
+                .object
+                .ok_or_else(|| Status::invalid_argument("object is required"))?;
+            let data = bytes::Bytes::from(inner.data);
+            let metadata = inner.metadata;
+            let meta = self
+                .handler
+                .storage
+                .put_object(
+                    &obj.bucket,
+                    &obj.key,
+                    data,
+                    &inner.content_type,
+                    metadata.clone(),
+                )
+                .await
+                .map_err(map_storage_err)?;
+
+            Ok(Response::new(PutObjectResponse {
+                etag: meta.etag,
+                size: meta.size,
+                last_modified: Some(ts_from_unix_secs(meta.last_modified_unix_secs)),
+                metadata,
+            }))
+        }
+        .await;
+
+        // Record metrics
+        let duration = start_time.elapsed().as_secs_f64();
+        let status = if result.is_ok() { "success" } else { "error" };
+        metrics::record_grpc_duration("put_object", status, duration);
+        metrics::increment_grpc_request("put_object", status);
+
+        result
     }
 
     async fn get_object(

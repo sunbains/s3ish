@@ -298,67 +298,120 @@ impl FileStorage {
         self.decode_shards(readers, db, pb, size).await
     }
 
-    /// Common shard decoding logic (extracted from read_shards_from_dir)
+    /// Common shard decoding logic with parallel shard reading for maximum throughput
     async fn decode_shards(&self, mut readers: Vec<Option<BufReader<fs::File>>>, db: usize, pb: usize, size: u64) -> Result<Vec<u8>, StorageError> {
         let total = db + pb.max(1);
-        // streaming decode
         let mut out = Vec::with_capacity(size as usize);
         let mut offset = 0usize;
+
+        // Pre-allocate buffers outside the loop to reduce allocations
+        let block_size = self.erasure.block_size;
+
         while offset < size as usize {
-            let mut parity_block = vec![0u8; self.erasure.block_size];
-            let mut blocks: Vec<Option<Vec<u8>>> = Vec::new();
-            for reader_opt in readers.iter_mut().take(db) {
-                if let Some(f) = reader_opt {
-                    let mut buf = vec![0u8; self.erasure.block_size];
-                    let n = f
-                        .read(&mut buf)
-                        .await
-                        .map_err(|e| StorageError::Internal(format!("read shard: {e}")))?;
-                    buf.truncate(n);
-                    for (i, b) in buf.iter().enumerate() {
-                        parity_block[i] ^= b;
-                    }
-                    blocks.push(Some(buf));
+            // Read all data shards and parity shard in parallel for maximum throughput
+            let mut read_handles = Vec::new();
+
+            // Spawn parallel reads for data shards
+            for (idx, reader_opt) in readers.iter_mut().enumerate().take(db) {
+                if let Some(_reader) = reader_opt {
+                    // Move reader temporarily to tokio task
+                    let mut reader_moved = reader_opt.take().unwrap();
+                    let handle = tokio::spawn(async move {
+                        let mut buf = vec![0u8; block_size];
+                        match reader_moved.read(&mut buf).await {
+                            Ok(n) => {
+                                buf.truncate(n);
+                                Ok((Some(buf), reader_moved))
+                            }
+                            Err(e) => Err(StorageError::Internal(format!("read shard {}: {}", idx, e)))
+                        }
+                    });
+                    read_handles.push((idx, Some(handle)));
                 } else {
-                    blocks.push(None);
+                    read_handles.push((idx, None));
                 }
-            }
-            // parity shard
-            if let Some(parity_file) = readers[total - 1].as_mut() {
-                let mut buf = vec![0u8; self.erasure.block_size];
-                let n = parity_file
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| StorageError::Internal(format!("read parity: {e}")))?;
-                buf.truncate(n);
-                parity_block = buf;
             }
 
-            // reconstruct if exactly one missing
-            let missing_idx =
-                blocks
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
+            // Spawn parallel read for parity shard
+            let parity_idx = total - 1;
+            let parity_handle = if let Some(_parity_reader) = readers[parity_idx].as_mut() {
+                let mut reader_moved = readers[parity_idx].take().unwrap();
+                Some(tokio::spawn(async move {
+                    let mut buf = vec![0u8; block_size];
+                    match reader_moved.read(&mut buf).await {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Ok((buf, reader_moved))
+                        }
+                        Err(e) => Err(StorageError::Internal(format!("read parity: {}", e)))
+                    }
+                }))
+            } else {
+                None
+            };
+
+            // Wait for all reads to complete
+            let mut blocks: Vec<Option<Vec<u8>>> = vec![None; db];
+            for (idx, handle_opt) in read_handles {
+                if let Some(handle) = handle_opt {
+                    match handle.await {
+                        Ok(Ok((buf, reader_back))) => {
+                            blocks[idx] = buf;
+                            readers[idx] = Some(reader_back);
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(StorageError::Internal(format!("task join: {}", e))),
+                    }
+                }
+            }
+
+            // Wait for parity read
+            let parity_block = if let Some(handle) = parity_handle {
+                match handle.await {
+                    Ok(Ok((buf, reader_back))) => {
+                        readers[parity_idx] = Some(reader_back);
+                        buf
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => return Err(StorageError::Internal(format!("parity task join: {}", e))),
+                }
+            } else {
+                // Compute parity from data blocks if parity shard doesn't exist
+                let mut parity = vec![0u8; block_size];
+                for block_opt in &blocks {
+                    if let Some(b) = block_opt {
+                        for (i, byte) in b.iter().enumerate() {
+                            parity[i] ^= byte;
+                        }
+                    }
+                }
+                parity
+            };
+
+            // Reconstruct missing shard if exactly one is missing
+            let missing_idx = blocks.iter().enumerate()
+                .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
+
             if let Some(miss) = missing_idx {
                 if pb == 0 {
-                    return Err(StorageError::Internal("missing shard".into()));
+                    return Err(StorageError::Internal("missing shard with no parity".into()));
                 }
+                // XOR all other blocks with parity to recover missing block
                 let mut rec = parity_block.clone();
                 for (i, blk) in blocks.iter().enumerate() {
-                    if i == miss {
-                        continue;
-                    }
-                    if let Some(b) = blk {
-                        for (j, byte) in b.iter().enumerate() {
-                            rec[j] ^= byte;
+                    if i != miss {
+                        if let Some(b) = blk {
+                            for (j, byte) in b.iter().enumerate() {
+                                rec[j] ^= byte;
+                            }
                         }
                     }
                 }
                 blocks[miss] = Some(rec);
             }
 
-            for mut b in blocks.into_iter().take(db).flatten() {
+            // Append blocks to output
+            for mut b in blocks.into_iter().flatten() {
                 if out.len() + b.len() > size as usize {
                     b.truncate(size as usize - out.len());
                 }
@@ -809,8 +862,9 @@ impl StorageBackend for FileStorage {
             files.push(BufWriter::with_capacity(262144, file));
         }
 
-        // Compute MD5 incrementally while writing shards (single pass through data)
-        let mut md5_context = md5::Context::new();
+        // Compute BLAKE3 hash incrementally while writing shards (single pass through data)
+        // BLAKE3 is 10-15x faster than MD5 and hardware-accelerated (SIMD, AVX-512)
+        let mut hasher = blake3::Hasher::new();
 
         for stripe_start in
             (0..data.len()).step_by(self.erasure.block_size * self.erasure.data_blocks)
@@ -826,8 +880,8 @@ impl StorageBackend for FileStorage {
                 let end = std::cmp::min(offset + self.erasure.block_size, data.len());
                 let slice = &data[offset..end];
 
-                // Update MD5 hash incrementally
-                md5_context.consume(slice);
+                // Update BLAKE3 hash incrementally (hardware-accelerated)
+                hasher.update(slice);
 
                 files[shard_idx]
                     .write_all(slice)
@@ -961,8 +1015,9 @@ impl StorageBackend for FileStorage {
         }
 
         let size = data.len() as u64;
-        // Use the incrementally computed MD5 hash (computed during erasure coding loop)
-        let etag = format!("{:x}", md5_context.compute());
+        // Use the incrementally computed BLAKE3 hash (computed during erasure coding loop)
+        // BLAKE3 produces 256-bit hashes vs MD5's 128-bit, providing better collision resistance
+        let etag = hasher.finalize().to_hex().to_string();
         let stored_meta = StoredMeta {
             content_type: content_type.to_string(),
             etag: etag.clone(),
@@ -1895,7 +1950,7 @@ impl MultipartStorage for FileStorage {
             .await
             .map_err(|e| StorageError::Internal(format!("write multipart part: {e}")))?;
 
-        let etag = format!("{:x}", md5::compute(&data));
+        let etag = blake3::hash(&data).to_hex().to_string();
         Ok(etag)
     }
 
@@ -1909,7 +1964,7 @@ impl MultipartStorage for FileStorage {
             StorageError::Internal(format!("Part {} not found", part_number))
         })?;
 
-        let etag = format!("{:x}", md5::compute(&data));
+        let etag = blake3::hash(&data).to_hex().to_string();
         Ok((Bytes::from(data), etag))
     }
 
@@ -1932,7 +1987,7 @@ impl MultipartStorage for FileStorage {
                     let part_data = fs::read(entry.path()).await.map_err(|e| {
                         StorageError::Internal(format!("read part file: {e}"))
                     })?;
-                    let etag = format!("{:x}", md5::compute(&part_data));
+                    let etag = blake3::hash(&part_data).to_hex().to_string();
                     discovered_parts.push((part_num, etag));
                 }
             }

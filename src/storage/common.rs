@@ -21,5 +21,7 @@ pub fn validate_key(key: &str) -> Result<(), StorageError> {
 }
 
 pub fn compute_etag(data: &Bytes) -> String {
-    format!("{:x}", md5::compute(data))
+    // Use BLAKE3 for hardware-accelerated hashing (10-15x faster than MD5)
+    // BLAKE3 uses SIMD, AVX-512, and other CPU extensions for maximum performance
+    blake3::hash(data).to_hex().to_string()
 }

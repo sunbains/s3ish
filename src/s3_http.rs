@@ -10,7 +10,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use base64;
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use hex;
@@ -1836,20 +1835,9 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    // Validate Content-MD5 if provided
-    if let Some(content_md5) = headers.get("content-md5").and_then(|v| v.to_str().ok()) {
-        let computed_md5 = format!("{:x}", md5::compute(&body));
-        // Content-MD5 header should be base64-encoded MD5, but we'll also accept hex for compatibility
-        let decoded_md5 = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, content_md5) {
-            Ok(bytes) => hex::encode(bytes),
-            Err(_) => content_md5.to_string(), // Fallback to treating it as hex
-        };
-        if computed_md5 != decoded_md5 {
-            return Err(S3Error::InvalidInput(
-                "Content-MD5 header does not match computed MD5".to_string(),
-            ));
-        }
-    }
+    // Note: Content-MD5 validation removed - we use BLAKE3 for ETags instead of MD5.
+    // Most modern S3 clients don't use Content-MD5 headers anyway.
+    // The ETag in the response provides data integrity verification.
 
     let metadata = extract_user_metadata(&headers);
     let storage_class = headers

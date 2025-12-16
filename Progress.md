@@ -47,3 +47,17 @@
   - Updated documentation: API_USAGE.md with examples, README.md features list, S3_COMPATIBILITY_ROADMAP.md marked as completed
   - Made S3Error enum public to support generate_presigned_url() as a public API
   - Tests/Lints: `cargo test --test presigned_urls`, `cargo test`, `cargo check`
+- 2025-12-16: Added comprehensive fuzz testing infrastructure with cargo-fuzz:
+  - Created 4 fuzz targets covering critical code paths:
+    - **storage_backend**: Bucket/key validation and storage operations (~50 exec/s)
+    - **erasure_coding**: Encode/decode with parity shards, recovery testing (~12,000 exec/s)
+    - **sigv4_parsing**: AWS SigV4 authorization header and query string parsing (~120,000 exec/s)
+    - **xml_parsing**: S3 XML request/response parsing (CreateBucket, CompleteMultipart, Delete) (~90,000 exec/s)
+  - Erasure coding fuzz includes roundtrip verification and single shard recovery tests
+  - SigV4 fuzz tests credential parsing, date validation, and signature handling
+  - XML fuzz tests malformed structures, unmatched tags, and truncated documents
+  - Storage backend fuzz tests async operations with malformed bucket names and keys
+  - Created comprehensive FUZZING.md documentation with usage examples, best practices, and CI/CD integration
+  - Updated README.md with fuzz testing quick start
+  - All fuzz targets compile and run successfully
+  - Tests/Lints: `cargo fuzz build`, `cargo fuzz run <target>`

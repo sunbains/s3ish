@@ -303,7 +303,24 @@ cargo test --test http_file_storage
 cargo test --test observability_integration_test
 ```
 
-All 126+ tests pass covering authentication, storage, gRPC, HTTP handlers, multipart uploads, erasure coding, and observability.
+All 132+ tests pass covering authentication, storage, gRPC, HTTP handlers, multipart uploads, erasure coding, pre-signed URLs, and observability.
+
+### Fuzz Testing
+
+s3ish includes comprehensive fuzz testing to discover edge cases and security vulnerabilities:
+
+```bash
+# Install cargo-fuzz (one time)
+cargo install cargo-fuzz
+
+# Run fuzz tests
+cargo fuzz run storage_backend -- -max_total_time=60
+cargo fuzz run erasure_coding -- -max_total_time=60
+cargo fuzz run sigv4_parsing -- -max_total_time=60
+cargo fuzz run xml_parsing -- -max_total_time=60
+```
+
+See [FUZZING.md](FUZZING.md) for detailed fuzzing documentation.
 
 ## License
 

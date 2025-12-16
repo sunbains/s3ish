@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 use base64;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use hex;
 use hmac::{Hmac, Mac};
@@ -20,7 +20,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -44,7 +43,6 @@ struct S3State {
     handler: Arc<BaseHandler>,
     renderer: Arc<dyn ResponseRenderer>,
     context: ResponseContext,
-    multipart_uploads: Arc<Mutex<HashMap<String, MultipartUpload>>>,
 }
 
 #[derive(Clone)]
@@ -110,30 +108,11 @@ impl S3State {
     }
 
     async fn init_multipart(&self, bucket: &str, key: &str) -> Result<String, S3Error> {
-        if !self.bucket_exists(bucket).await? {
-            return Err(S3Error::BucketNotFound(bucket.to_string()));
-        }
-        let upload_id = Uuid::new_v4().simple().to_string();
-        let mut map = self.multipart_uploads.lock().await;
-        map.insert(
-            upload_id.clone(),
-            MultipartUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                parts: HashMap::new(),
-            },
-        );
-
         // Record multipart metrics
         metrics::increment_multipart_init();
         metrics::inc_multipart_active();
 
-        tracing::debug!(
-            bucket = %bucket,
-            key = %key,
-            upload_id = %upload_id,
-            "Multipart upload initiated"
-        );
+        let upload_id = self.handler.storage.initiate_multipart(bucket, key).await?;
 
         Ok(upload_id)
     }
@@ -148,42 +127,17 @@ impl S3State {
     ) -> Result<String, S3Error> {
         let start_time = std::time::Instant::now();
 
-        let mut map = self.multipart_uploads.lock().await;
-        let entry = map
-            .get_mut(upload_id)
-            .ok_or_else(|| S3Error::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            })?;
-        if entry.bucket != bucket || entry.key != key {
-            return Err(S3Error::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
-        let etag = format!("{:x}", md5::compute(body));
-        entry.parts.insert(
-            part_number,
-            MultipartPart {
-                etag: etag.clone(),
-                data: Bytes::copy_from_slice(body),
-            },
-        );
+        let data = Bytes::copy_from_slice(body);
+        let etag = self
+            .handler
+            .storage
+            .upload_part(bucket, key, upload_id, part_number, data)
+            .await?;
 
         // Record multipart part metrics
         let duration = start_time.elapsed().as_secs_f64();
         metrics::record_multipart_part_duration(duration);
         metrics::record_multipart_part_size(body.len());
-
-        tracing::debug!(
-            bucket = %bucket,
-            key = %key,
-            upload_id = %upload_id,
-            part_number = part_number,
-            size = body.len(),
-            duration_ms = duration * 1000.0,
-            "Multipart part uploaded"
-        );
 
         Ok(etag)
     }
@@ -197,64 +151,15 @@ impl S3State {
     ) -> Result<String, S3Error> {
         let start_time = std::time::Instant::now();
 
-        let mut map = self.multipart_uploads.lock().await;
-        let entry = map.remove(upload_id).ok_or_else(|| S3Error::NoSuchUpload {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-        })?;
-        if entry.bucket != bucket || entry.key != key {
-            return Err(S3Error::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            });
-        }
+        // If no parts specified, the storage backend will use all parts
+        // Otherwise, pass the requested parts
+        let parts = requested_parts.unwrap_or_default();
 
-        let parts: Vec<(u32, MultipartPart)> = if let Some(req_parts) = requested_parts {
-            let mut out = Vec::new();
-            for (num, etag) in req_parts {
-                match entry.parts.get(&num) {
-                    Some(p) if normalize_etag(&p.etag) == normalize_etag(&etag) => {
-                        out.push((num, p.clone()))
-                    }
-                    _ => {
-                        return Err(S3Error::InvalidPart(format!(
-                            "invalid part {} for upload {}",
-                            num, upload_id
-                        )))
-                    }
-                }
-            }
-            out
-        } else {
-            entry.parts.into_iter().collect()
-        };
-
-        if parts.is_empty() {
-            return Err(S3Error::InvalidPart(
-                "no parts provided for completion".to_string(),
-            ));
-        }
-
-        let mut ordered = parts;
-        ordered.sort_by_key(|(n, _)| *n);
-        let parts_count = ordered.len();
-        let mut buf = BytesMut::new();
-        for (_, part) in ordered {
-            buf.extend_from_slice(&part.data);
-        }
-
+        let parts_count = parts.len();
         let meta = self
             .handler
             .storage
-            .put_object(
-                bucket,
-                key,
-                buf.freeze(),
-                "application/octet-stream",
-                HashMap::new(),
-                None, // storage_class: Will be set via individual parts if needed
-                None, // server_side_encryption: Will be set via individual parts if needed
-            )
+            .complete_multipart(bucket, key, upload_id, parts)
             .await?;
 
         // Record multipart completion metrics
@@ -275,27 +180,15 @@ impl S3State {
     }
 
     async fn abort_upload(&self, bucket: &str, key: &str, upload_id: &str) -> Result<(), S3Error> {
-        let mut map = self.multipart_uploads.lock().await;
-        let result = match map.remove(upload_id) {
-            Some(entry) if entry.bucket == bucket && entry.key == key => {
-                // Decrement active uploads when aborting
-                metrics::dec_multipart_active();
+        self.handler
+            .storage
+            .abort_multipart(bucket, key, upload_id)
+            .await?;
 
-                tracing::debug!(
-                    bucket = %bucket,
-                    key = %key,
-                    upload_id = %upload_id,
-                    "multipart upload aborted"
-                );
+        // Decrement active uploads when aborting
+        metrics::dec_multipart_active();
 
-                Ok(())
-            }
-            _ => Err(S3Error::NoSuchUpload {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            }),
-        };
-        result
+        Ok(())
     }
 }
 
@@ -322,7 +215,6 @@ impl S3HttpHandler {
             handler: Arc::new(handler),
             renderer,
             context: global_ctx.clone(),
-            multipart_uploads: Arc::new(Mutex::new(HashMap::new())),
         };
         Self { state }
     }
@@ -546,18 +438,6 @@ pub struct ObjectEntry {
     size: u64,
 }
 
-#[derive(Debug)]
-struct MultipartUpload {
-    bucket: String,
-    key: String,
-    parts: HashMap<u32, MultipartPart>,
-}
-
-#[derive(Debug, Clone)]
-struct MultipartPart {
-    etag: String,
-    data: Bytes,
-}
 
 #[derive(Debug, Deserialize)]
 struct DeleteQuery {
@@ -652,6 +532,12 @@ impl From<StorageError> for S3Error {
             StorageError::ObjectNotFound { bucket, key } => S3Error::ObjectNotFound { bucket, key },
             StorageError::InvalidInput(msg) => S3Error::InvalidInput(msg),
             StorageError::Internal(msg) => S3Error::Internal(msg),
+            StorageError::NoSuchUpload {
+                bucket,
+                key,
+                upload_id: _,
+            } => S3Error::NoSuchUpload { bucket, key },
+            StorageError::InvalidPart(msg) => S3Error::InvalidPart(msg),
         }
     }
 }

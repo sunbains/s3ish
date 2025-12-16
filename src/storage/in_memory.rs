@@ -8,6 +8,7 @@ use chrono::Utc;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks for simulated erasure coding
 
@@ -16,6 +17,19 @@ struct StoredObject {
     shards: Vec<Bytes>,
     orig_len: usize,
     meta: ObjectMetadata,
+}
+
+#[derive(Debug, Clone)]
+struct MultipartUpload {
+    bucket: String,
+    key: String,
+    parts: HashMap<u32, MultipartPart>,
+}
+
+#[derive(Debug, Clone)]
+struct MultipartPart {
+    etag: String,
+    data: Bytes,
 }
 
 /// In-memory storage implementation with simulated erasure coding.
@@ -29,6 +43,7 @@ struct StoredObject {
 pub struct InMemoryStorage {
     buckets: Arc<RwLock<BTreeSet<String>>>,
     objects: Arc<RwLock<BTreeMap<(String, String), StoredObject>>>,
+    multipart_uploads: Arc<RwLock<HashMap<String, MultipartUpload>>>,
     erasure: Erasure,
 }
 
@@ -37,6 +52,7 @@ impl InMemoryStorage {
         Self {
             buckets: Arc::new(RwLock::new(BTreeSet::new())),
             objects: Arc::new(RwLock::new(BTreeMap::new())),
+            multipart_uploads: Arc::new(RwLock::new(HashMap::new())),
             erasure: Erasure::new(4, 2, ERASURE_CHUNK_SIZE).expect("erasure init"),
         }
     }
@@ -295,6 +311,193 @@ impl StorageBackend for InMemoryStorage {
             },
         );
         Ok(meta)
+    }
+
+    async fn initiate_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, StorageError> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        // Check bucket exists
+        {
+            let b = self.buckets.read().await;
+            if !b.contains(bucket) {
+                return Err(StorageError::BucketNotFound(bucket.to_string()));
+            }
+        }
+
+        let upload_id = Uuid::new_v4().simple().to_string();
+        let mut uploads = self.multipart_uploads.write().await;
+        uploads.insert(
+            upload_id.clone(),
+            MultipartUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                parts: HashMap::new(),
+            },
+        );
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            "Multipart upload initiated"
+        );
+
+        Ok(upload_id)
+    }
+
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: Bytes,
+    ) -> Result<String, StorageError> {
+        let mut uploads = self.multipart_uploads.write().await;
+        let upload = uploads.get_mut(upload_id).ok_or_else(|| {
+            StorageError::NoSuchUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            }
+        })?;
+
+        if upload.bucket != bucket || upload.key != key {
+            return Err(StorageError::NoSuchUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        let etag = compute_etag(&data);
+        upload.parts.insert(
+            part_number,
+            MultipartPart {
+                etag: etag.clone(),
+                data,
+            },
+        );
+
+        tracing::debug!(
+            bucket = %bucket,
+            key = %key,
+            upload_id = %upload_id,
+            part_number = part_number,
+            "Multipart part uploaded"
+        );
+
+        Ok(etag)
+    }
+
+    async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(u32, String)>,
+    ) -> Result<ObjectMetadata, StorageError> {
+        let mut uploads = self.multipart_uploads.write().await;
+        let upload = uploads.remove(upload_id).ok_or_else(|| {
+            StorageError::NoSuchUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            }
+        })?;
+
+        if upload.bucket != bucket || upload.key != key {
+            return Err(StorageError::NoSuchUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // Validate parts and collect data
+        let mut ordered_parts = Vec::new();
+
+        if parts.is_empty() {
+            // If no parts specified, use all uploaded parts
+            for (part_num, part) in &upload.parts {
+                ordered_parts.push((*part_num, part.clone()));
+            }
+            if ordered_parts.is_empty() {
+                return Err(StorageError::InvalidPart(
+                    "No parts uploaded for completion".to_string(),
+                ));
+            }
+        } else {
+            // Validate specified parts
+            for (part_num, expected_etag) in parts {
+                let part = upload.parts.get(&part_num).ok_or_else(|| {
+                    StorageError::InvalidPart(format!(
+                        "Part {} not found for upload {}",
+                        part_num, upload_id
+                    ))
+                })?;
+
+                // Normalize ETags for comparison (remove quotes if present)
+                if part.etag.trim_matches('"') != expected_etag.trim_matches('"') {
+                    return Err(StorageError::InvalidPart(format!(
+                        "ETag mismatch for part {}: expected {}, got {}",
+                        part_num, expected_etag, part.etag
+                    )));
+                }
+
+                ordered_parts.push((part_num, part.clone()));
+            }
+        }
+
+        // Sort by part number and concatenate
+        ordered_parts.sort_by_key(|(n, _)| *n);
+        let mut combined = bytes::BytesMut::new();
+        for (_, part) in ordered_parts {
+            combined.extend_from_slice(&part.data);
+        }
+
+        // Store as a regular object
+        let final_data = combined.freeze();
+        self.put_object(
+            bucket,
+            key,
+            final_data,
+            "application/octet-stream",
+            HashMap::new(),
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn abort_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut uploads = self.multipart_uploads.write().await;
+        match uploads.remove(upload_id) {
+            Some(upload) if upload.bucket == bucket && upload.key == key => {
+                tracing::debug!(
+                    bucket = %bucket,
+                    key = %key,
+                    upload_id = %upload_id,
+                    "Multipart upload aborted"
+                );
+                Ok(())
+            }
+            _ => Err(StorageError::NoSuchUpload {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+            }),
+        }
     }
 }
 

@@ -56,6 +56,10 @@ fn map_storage_err(e: StorageError) -> Status {
         }
         StorageError::InvalidInput(m) => Status::invalid_argument(m),
         StorageError::Internal(m) => Status::internal(m),
+        StorageError::NoSuchUpload { bucket, key, upload_id } => {
+            Status::not_found(format!("multipart upload not found: {bucket}/{key} upload_id={upload_id}"))
+        }
+        StorageError::InvalidPart(m) => Status::invalid_argument(m),
     }
 }
 

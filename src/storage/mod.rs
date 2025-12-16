@@ -30,6 +30,14 @@ pub enum StorageError {
     InvalidInput(String),
     #[error("internal storage error: {0}")]
     Internal(String),
+    #[error("multipart upload not found: {bucket}/{key} upload_id={upload_id}")]
+    NoSuchUpload {
+        bucket: String,
+        key: String,
+        upload_id: String,
+    },
+    #[error("invalid part: {0}")]
+    InvalidPart(String),
 }
 
 #[async_trait]
@@ -76,4 +84,35 @@ pub trait StorageBackend: Send + Sync + 'static {
         storage_class: Option<String>,
         server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError>;
+
+    // Multipart upload operations
+    async fn initiate_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, StorageError>;
+
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: bytes::Bytes,
+    ) -> Result<String, StorageError>; // Returns ETag
+
+    async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(u32, String)>, // Vec of (part_number, etag)
+    ) -> Result<ObjectMetadata, StorageError>;
+
+    async fn abort_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), StorageError>;
 }

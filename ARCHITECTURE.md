@@ -36,7 +36,8 @@ This project implements a pluggable architecture that allows you to serve the sa
     ┌─────────────────────────────────────┐
     │      Storage & Auth Backends        │
     │  - FileAuthenticator                │
-    │  - InMemoryStorage                  │
+    │  - InMemoryStorage / FileStorage    │
+    │  - Observability (Metrics, Logs)    │
     │  (Pluggable implementations)        │
     └─────────────────────────────────────┘
 ```
@@ -178,7 +179,8 @@ pub trait StorageBackend: Send + Sync + 'static {
 ```
 
 **Built-in implementations:**
-- `InMemoryStorage` - In-memory storage using BTreeMap
+- `InMemoryStorage` - In-memory storage using BTreeMap with optional simulated erasure coding
+- `FileStorage` - Filesystem-based persistent storage with optional erasure coding (data shards + parity)
 
 **Example custom implementation:**
 ```rust
@@ -239,18 +241,69 @@ impl ConnectionManager for WebDavConnectionManager {
 }
 ```
 
+## Observability
+
+s3ish includes comprehensive observability features built into the architecture:
+
+### Metrics Collection
+
+All protocol handlers automatically record metrics using Prometheus:
+
+- **HTTP Metrics**: Request duration, count, status codes
+- **gRPC Metrics**: RPC duration, status codes
+- **Storage Metrics**: Operation latency, lock contention, object counts, bytes stored
+- **Auth Metrics**: Authentication duration, success/failure rates, SigV4 stage profiling
+- **Multipart Metrics**: Active uploads, part sizes, completion duration
+
+Metrics endpoint: `GET /_metrics`
+
+### Structured Logging
+
+Configurable logging with two output formats:
+
+- **JSON**: Structured logs for production environments
+- **Human**: Colored, readable logs for development
+
+Set via `LOG_FORMAT` environment variable. All operations include trace spans with context (bucket, key, operation, duration).
+
+### Health Checks
+
+Built-in health endpoints for orchestration:
+
+- **Liveness**: `GET /_health` - Returns 200 if service is running
+- **Readiness**: `GET /_ready` - Returns 200 if backends are healthy, 503 otherwise
+
+### Configuration
+
+```bash
+# JSON logs for production
+LOG_FORMAT=json RUST_LOG=info ./s3ish
+
+# Human-readable for development
+LOG_FORMAT=human RUST_LOG=debug ./s3ish
+```
+
+See [OBSERVABILITY.md](OBSERVABILITY.md) for complete metrics documentation and Grafana integration.
+
 ## Testing
 
-All components have comprehensive unit tests:
+All components have comprehensive unit and integration tests:
 
-- **Auth tests**: 13 tests covering metadata extraction and file-based authentication
-- **Storage tests**: 25 tests covering all CRUD operations
-- **gRPC Service tests**: 14 tests covering the gRPC protocol
-- **S3 HTTP tests**: 3 tests covering the HTTP protocol
+- **Auth tests**: 13+ tests covering metadata extraction, file-based auth, and SigV4
+- **Storage tests**: 40+ tests covering CRUD operations, erasure coding, and filesystem storage
+- **gRPC Service tests**: 14+ tests covering the gRPC protocol
+- **S3 HTTP tests**: 50+ tests covering HTTP protocol, multipart uploads, CopyObject, and XML responses
+- **Observability tests**: 10+ tests covering metrics, health checks, and logging
+- **Total**: 126+ tests
 
 Run tests:
 ```bash
+# All tests
 cargo test
+
+# Specific test suites
+cargo test --test http_file_storage
+cargo test --test observability_integration_test
 ```
 
 ## Benefits of This Architecture

@@ -1,190 +1,192 @@
 # S3 Compatibility Roadmap
 
-This document outlines what's needed to make s3ish fully S3-compatible for single-host vertical scaling.
+This document outlines the path to full S3 compatibility for s3ish. Many core features have been implemented.
 
-## Phase 1: Core S3 API (Critical for Basic Compatibility)
+## Implementation Status Summary
 
-### 1.1 AWS Signature V4 Authentication
-**Current:** Simple header-based auth (`x-access-key`, `x-secret-key`)
-**Needed:** Full AWS SigV4 implementation
+### ✅ Completed (Production-Ready)
+- **AWS SigV4 Authentication** - Full implementation with performance profiling
+- **XML Response Format** - Complete S3-compliant XML for all operations
+- **S3-Compatible Endpoints** - All major endpoints (path-style)
+- **S3 Headers Support** - Comprehensive request/response header handling
+- **File System Backend** - Persistent storage with erasure coding
+- **Multipart Uploads** - Complete multipart upload protocol
+- **CopyObject** - Full CopyObject support with metadata directives
+- **User Metadata** - x-amz-meta-* headers fully supported
+- **Range Requests** - HTTP Range header support
+- **Observability** - 66+ Prometheus metrics, structured logging, health checks
 
-```rust
-// Add dependencies to Cargo.toml
-aws-sigv4 = "1.2"
-aws-credential-types = "1.2"
-sha2 = "0.10"
-hex = "0.4"
-hmac = "0.12"
+### 🚧 Partial / In Progress
+- **Pre-signed URLs** - SigV4 query string auth not yet implemented
+- **Storage Classes** - Headers accepted but not enforced
+- **Encryption** - Headers accepted but not implemented
 
-// Implementation tasks:
-- [ ] Parse Authorization header (AWS4-HMAC-SHA256 format)
-- [ ] Extract signature components (access key, date, region, service)
-- [ ] Calculate canonical request
-- [ ] Calculate string to sign
-- [ ] Verify HMAC-SHA256 signature
-- [ ] Support query string authentication (pre-signed URLs)
-- [ ] Handle credential scope validation
-```
+### ❌ Not Yet Implemented
+- **Object Versioning** - Not implemented
+- **Bucket Policies & ACLs** - Not implemented
+- **Server-Side Encryption** - Not implemented
+- **Virtual-Hosted Style URLs** - Only path-style supported
+- **Lifecycle Policies** - Not implemented
 
-**Complexity:** High (3-5 days)
-**Impact:** Required for S3 clients to connect
+## Phase 1: Core S3 API ✅ MOSTLY COMPLETED
 
-### 1.2 XML Response Format
-**Current:** JSON responses
-**Needed:** S3-compliant XML
-
-```rust
-// Add dependency
-quick-xml = "0.31"
-serde-xml-rs = "0.6"
-
-// Implementation tasks:
-- [ ] ListBucketResult XML format
-- [ ] Error response XML format
-- [ ] CreateBucketConfiguration
-- [ ] CompleteMultipartUploadResult
-- [ ] Custom XML serialization for S3 schemas
-```
-
-**Example XML Response:**
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-    <Name>bucket</Name>
-    <Prefix>photos/</Prefix>
-    <MaxKeys>1000</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-    <Contents>
-        <Key>photos/2024/image.jpg</Key>
-        <LastModified>2024-01-15T10:30:00.000Z</LastModified>
-        <ETag>"d41d8cd98f00b204e9800998ecf8427e"</ETag>
-        <Size>12345</Size>
-        <StorageClass>STANDARD</StorageClass>
-    </Contents>
-</ListBucketResult>
-```
-
-**Complexity:** Medium (2-3 days)
-**Impact:** Required for S3 clients to parse responses
-
-### 1.3 S3-Compatible Endpoints
-**Current:** Custom REST endpoints
-**Needed:** S3 path-style and virtual-hosted-style
+### 1.1 AWS Signature V4 Authentication ✅ COMPLETED
+**Status:** ✅ Fully implemented
+**Details:** Full AWS SigV4 implementation with performance profiling
 
 ```rust
-// Path-style (host/bucket/key)
-GET    /{bucket}/{key}           // GetObject
-PUT    /{bucket}/{key}           // PutObject
-DELETE /{bucket}/{key}           // DeleteObject
-HEAD   /{bucket}/{key}           // HeadObject
-GET    /{bucket}/               // ListObjects
-PUT    /{bucket}/               // CreateBucket
-DELETE /{bucket}/               // DeleteBucket
-GET    /                        // ListBuckets
-
-// Query parameters for operations
-POST   /{bucket}/{key}?uploads                    // InitiateMultipartUpload
-PUT    /{bucket}/{key}?uploadId=X&partNumber=N   // UploadPart
-POST   /{bucket}/{key}?uploadId=X                // CompleteMultipartUpload
-DELETE /{bucket}/{key}?uploadId=X                // AbortMultipartUpload
-POST   /{bucket}/?delete                         // DeleteObjects (multi-delete)
+// Implemented:
+- [x] Parse Authorization header (AWS4-HMAC-SHA256 format)
+- [x] Extract signature components (access key, date, region, service)
+- [x] Calculate canonical request
+- [x] Calculate string to sign
+- [x] Verify HMAC-SHA256 signature
+- [x] Stage-by-stage performance profiling metrics
+- [ ] Support query string authentication (pre-signed URLs) - NOT YET
+- [x] Handle credential scope validation
 ```
 
-**Implementation tasks:**
-- [ ] Update router to match S3 endpoint patterns
-- [ ] Support query parameter routing
-- [ ] Implement ListBuckets operation
-- [ ] Support both path-style and virtual-hosted-style URLs
-- [ ] Handle content-type for each operation
+**Implementation:** See `src/s3_http.rs` - SigV4 verification with detailed metrics
+**Impact:** S3 clients (AWS CLI, boto3) can now connect
 
-**Complexity:** Medium (2-3 days)
-**Impact:** Required for AWS CLI/SDKs
-
-### 1.4 S3 Headers Support
-**Current:** Basic content-type, etag
-**Needed:** Full S3 header suite
+### 1.2 XML Response Format ✅ COMPLETED
+**Status:** ✅ Fully implemented
+**Details:** Complete S3-compliant XML response system
 
 ```rust
-// Request headers to support:
-- x-amz-content-sha256       // Payload hash
-- x-amz-date                 // Request timestamp
-- x-amz-security-token       // STS token (optional)
-- x-amz-meta-*               // User metadata
-- x-amz-storage-class        // Storage class
-- x-amz-server-side-encryption  // Encryption (can fake)
-- Content-MD5                // Integrity check
-- If-Match, If-None-Match    // Conditional requests
-- Range                      // Partial downloads
-
-// Response headers to return:
-- x-amz-request-id           // Unique request ID
-- x-amz-id-2                 // Extended request ID
-- x-amz-version-id           // Object version (if versioning)
-- ETag                       // MD5 of content
-- Last-Modified              // Timestamp
-- Content-Type               // MIME type
-- Content-Length             // Size
-- Accept-Ranges: bytes       // Range support
+// Implemented:
+- [x] ListBucketResult XML format
+- [x] ListAllMyBucketsResult XML format
+- [x] Error response XML format
+- [x] CreateBucketConfiguration
+- [x] CompleteMultipartUploadResult
+- [x] InitiateMultipartUploadResult
+- [x] CopyObjectResult
+- [x] DeleteResult (multi-object delete)
+- [x] Custom XML serialization via ResponseRenderer trait
 ```
 
-**Complexity:** Low-Medium (1-2 days)
-**Impact:** Required for proper client operation
+**Implementation:** See `src/s3_http.rs` - ResponseRenderer trait with XML implementation
+**Impact:** S3 clients can parse all responses correctly
+
+### 1.3 S3-Compatible Endpoints ✅ COMPLETED
+**Status:** ✅ Fully implemented (path-style)
+**Details:** Complete S3 endpoint coverage with query parameter routing
+
+```rust
+// Implemented (Path-style):
+- [x] GET    /{bucket}/{key}           // GetObject
+- [x] PUT    /{bucket}/{key}           // PutObject
+- [x] DELETE /{bucket}/{key}           // DeleteObject
+- [x] HEAD   /{bucket}/{key}           // HeadObject
+- [x] PATCH  /{bucket}/{key}           // CopyObject (also via PUT with x-amz-copy-source)
+- [x] GET    /{bucket}/               // ListObjects
+- [x] HEAD   /{bucket}/               // HeadBucket
+- [x] PUT    /{bucket}/               // CreateBucket
+- [x] DELETE /{bucket}/               // DeleteBucket
+- [x] GET    /                        // ListBuckets
+
+// Query parameter operations:
+- [x] POST   /{bucket}/{key}?uploads                    // InitiateMultipartUpload
+- [x] PUT    /{bucket}/{key}?uploadId=X&partNumber=N   // UploadPart
+- [x] POST   /{bucket}/{key}?uploadId=X                // CompleteMultipartUpload
+- [x] DELETE /{bucket}/{key}?uploadId=X                // AbortMultipartUpload
+- [x] POST   /{bucket}/?delete                         // DeleteObjects (multi-delete)
+```
+
+**Implementation:** See `src/s3_http.rs` - Full Axum router with query parameter handling
+**Impact:** AWS CLI/SDKs work correctly
+**Note:** Virtual-hosted-style not yet implemented (not critical for single-host deployment)
+
+### 1.4 S3 Headers Support ✅ MOSTLY COMPLETED
+**Status:** ✅ Most headers implemented
+**Details:** Comprehensive S3 header support for requests and responses
+
+```rust
+// Request headers supported:
+- [x] x-amz-content-sha256       // Payload hash (for SigV4)
+- [x] x-amz-date                 // Request timestamp (for SigV4)
+- [ ] x-amz-security-token       // STS token - NOT YET
+- [x] x-amz-meta-*               // User metadata (full support)
+- [ ] x-amz-storage-class        // Storage class - NOT YET
+- [ ] x-amz-server-side-encryption  // Encryption - NOT YET
+- [ ] Content-MD5                // Integrity check - NOT YET
+- [x] If-Match, If-None-Match    // Conditional requests
+- [x] x-amz-copy-source-if-match, x-amz-copy-source-if-none-match
+- [x] Range                      // Partial downloads
+- [x] x-amz-copy-source          // CopyObject source
+- [x] x-amz-metadata-directive   // COPY/REPLACE for CopyObject
+
+// Response headers returned:
+- [x] x-amz-request-id           // Unique request ID (UUID)
+- [x] x-amz-id-2                 // Extended request ID
+- [x] x-amz-bucket-region        // Bucket region
+- [ ] x-amz-version-id           // Object version - NOT YET (no versioning)
+- [x] ETag                       // MD5 of content (quoted)
+- [x] Last-Modified              // ISO 8601 timestamp
+- [x] Content-Type               // MIME type
+- [x] Content-Length             // Size
+- [x] Accept-Ranges: bytes       // Range support
+- [x] x-amz-meta-*               // User metadata echoed back
+```
+
+**Implementation:** See `src/s3_http.rs` - Header handling throughout HTTP handler
+**Impact:** AWS CLI/SDKs work correctly with proper metadata and conditional requests
 
 ## Phase 2: Persistent Storage (Critical for Production)
 
-### 2.1 File System Backend
-**Current:** In-memory BTreeMap
-**Needed:** Disk-based storage
+### 2.1 File System Backend ✅ COMPLETED
+**Status:** ✅ Fully implemented with erasure coding support
+**Details:** Production-ready filesystem storage backend
 
 ```rust
-pub struct FileSystemStorage {
-    base_path: PathBuf,           // e.g., /var/lib/s3ish/data
-    metadata_db: sled::Db,        // Embedded KV store for metadata
+pub struct FileStorage {
+    base_path: PathBuf,           // e.g., ./s3-data
+    enable_erasure: bool,         // Optional erasure coding
+    data_blocks: usize,           // Data shards (default: 2)
+    parity_blocks: usize,         // Parity shards (default: 1)
 }
 
-// Directory structure:
-// /var/lib/s3ish/
-//   data/
-//     {bucket}/
-//       {hash-prefix}/
-//         {object-hash}           // Actual data (content-addressed)
-//   metadata/                     // sled database
-//     buckets/                    // Bucket metadata
-//     objects/                    // Object metadata
-//     multipart/                  // In-progress uploads
+// Implemented directory structure:
+// ./s3-data/
+//   {bucket}/
+//     {key}/
+//       data.0, data.1, ...       // Data shards (if erasure coding)
+//       parity.0, parity.1, ...   // Parity shards (if erasure coding)
+//       data                      // Single file (if no erasure coding)
+//       metadata.json             // Object metadata sidecar
 
-// Object metadata (stored in sled):
+// Object metadata (stored as JSON sidecar):
 struct ObjectMetadata {
-    bucket: String,
-    key: String,
-    size: u64,
-    etag: String,
     content_type: String,
-    last_modified: i64,
-    user_metadata: HashMap<String, String>,
-    storage_hash: String,          // Content-addressed hash
-    parts: Option<Vec<PartInfo>>,  // For multipart uploads
+    etag: String,
+    size: u64,
+    last_modified_unix_secs: i64,
+    metadata: HashMap<String, String>,  // User metadata
 }
 ```
 
-**Implementation tasks:**
-- [ ] Add sled dependency for metadata storage
-- [ ] Implement FileSystemStorage backend
-- [ ] Content-addressed storage (dedupe identical objects)
-- [ ] Atomic file operations (temp file + rename)
-- [ ] Garbage collection for orphaned data
-- [ ] Directory sharding (avoid too many files in one dir)
-- [ ] Fsync for durability guarantees
+**Implemented features:**
+- [x] Implement FileStorage backend (src/storage/file_storage.rs)
+- [x] Optional erasure coding with configurable data/parity blocks
+- [x] Streaming shard encode/decode (no full buffering)
+- [x] Atomic file operations via tempfile crate
+- [x] JSON sidecar files for metadata
+- [x] Directory-based bucket/key hierarchy
+- [x] Full test coverage including large file streaming
 
-**Complexity:** Medium-High (4-5 days)
-**Impact:** Required for data persistence
-
-**Dependencies:**
+**Configuration:**
 ```toml
-sled = "0.34"           # Embedded KV database
-tempfile = "3.8"        # Atomic file operations
-walkdir = "2.4"         # Directory traversal
+[storage]
+backend = "file"
+path = "./s3-data"
+erasure_coding = true
+data_blocks = 2
+parity_blocks = 1
 ```
+
+**Implementation:** See `src/storage/file_storage.rs`
+**Impact:** Data persists across restarts with optional redundancy
 
 ### 2.2 Storage Backend Abstraction Updates
 ```rust
@@ -215,36 +217,41 @@ pub trait StorageBackend: Send + Sync + 'static {
 
 **Complexity:** Medium (2-3 days)
 
-## Phase 3: Multipart Upload (Important for Large Files)
+## Phase 3: Multipart Upload ✅ COMPLETED
 
-### 3.1 Multipart Upload State Management
+### 3.1 Multipart Upload State Management ✅ COMPLETED
+**Status:** ✅ Fully implemented
+**Details:** Complete multipart upload support with in-memory state management
+
 ```rust
+// Implemented state management:
 struct MultipartUpload {
-    upload_id: String,
+    upload_id: String,            // UUID-based upload ID
     bucket: String,
     key: String,
-    initiated: i64,
-    parts: BTreeMap<u32, PartInfo>,  // part_number -> PartInfo
+    initiated_at: i64,
+    parts: BTreeMap<u32, UploadedPart>,  // part_number -> UploadedPart
 }
 
-struct PartInfo {
+struct UploadedPart {
     part_number: u32,
     etag: String,
-    size: u64,
-    storage_path: PathBuf,
+    data: Bytes,                  // In-memory storage of part data
 }
 ```
 
-**Implementation tasks:**
-- [ ] Generate unique upload IDs
-- [ ] Store parts temporarily during upload
-- [ ] Validate part ETags on completion
-- [ ] Combine parts into final object
-- [ ] Clean up aborted/expired uploads
-- [ ] Handle concurrent part uploads
+**Implemented features:**
+- [x] Generate unique upload IDs (UUID-based)
+- [x] Store parts in memory during upload
+- [x] Validate part ETags on completion
+- [x] Combine parts into final object
+- [x] Abort multipart uploads
+- [x] Handle concurrent part uploads with mutex
+- [x] Full XML request/response support
+- [x] Prometheus metrics for multipart operations
 
-**Complexity:** Medium-High (3-4 days)
-**Impact:** Required for files > 5GB, recommended for all large files
+**Implementation:** See `src/s3_http.rs` - MultipartUpload state in S3State
+**Impact:** Large file uploads work correctly via multipart protocol
 
 ### 3.2 Part Size Validation
 ```rust

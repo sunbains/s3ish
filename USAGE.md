@@ -257,11 +257,169 @@ The S3 HTTP API returns appropriate HTTP status codes:
 | **Use Case** | Internal services | Public APIs, CLIs |
 | **Tools** | grpcurl, BloomRPC | curl, wget, Postman |
 
+## Advanced Features
+
+### Multipart Uploads
+
+For uploading large objects in parts:
+
+```bash
+# Initiate multipart upload
+UPLOAD_ID=$(curl -s -X POST "http://localhost:9000/my-bucket/largefile.bin?uploads" \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" | grep -oP '(?<=<UploadId>)[^<]+')
+
+# Upload part 1
+curl -X PUT "http://localhost:9000/my-bucket/largefile.bin?uploadId=$UPLOAD_ID&partNumber=1" \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  --data-binary @part1.bin
+
+# Upload part 2
+curl -X PUT "http://localhost:9000/my-bucket/largefile.bin?uploadId=$UPLOAD_ID&partNumber=2" \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  --data-binary @part2.bin
+
+# Complete multipart upload
+curl -X POST "http://localhost:9000/my-bucket/largefile.bin?uploadId=$UPLOAD_ID" \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  -H "Content-Type: application/xml" \
+  -d '<CompleteMultipartUpload>
+        <Part><PartNumber>1</PartNumber><ETag>"etag1"</ETag></Part>
+        <Part><PartNumber>2</PartNumber><ETag>"etag2"</ETag></Part>
+      </CompleteMultipartUpload>'
+```
+
+### CopyObject
+
+Copy objects within or across buckets:
+
+```bash
+# Copy object
+curl -X PATCH http://localhost:9000/dest-bucket/newfile.txt \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  -H "x-amz-copy-source: /source-bucket/original.txt"
+
+# Copy with metadata replacement
+curl -X PATCH http://localhost:9000/dest-bucket/newfile.txt \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  -H "x-amz-copy-source: /source-bucket/original.txt" \
+  -H "x-amz-metadata-directive: REPLACE" \
+  -H "content-type: text/plain" \
+  -H "x-amz-meta-version: 2.0"
+```
+
+### Range Requests
+
+Download partial object content:
+
+```bash
+# Get first 100 bytes
+curl http://localhost:9000/my-bucket/largefile.bin \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  -H "Range: bytes=0-99"
+```
+
+### AWS SigV4 Authentication
+
+Use AWS Signature Version 4 for authentication:
+
+```bash
+# See QUICK_START_S3.md for examples using aws-cli and boto3
+# SigV4 is automatically supported alongside header-based auth
+```
+
+### User Metadata
+
+Store and retrieve custom metadata with objects:
+
+```bash
+# Upload with metadata
+curl -X PUT http://localhost:9000/my-bucket/file.txt \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123" \
+  -H "x-amz-meta-author: John Doe" \
+  -H "x-amz-meta-department: Engineering" \
+  -d "File content"
+
+# Metadata is returned in GET/HEAD responses
+curl -I http://localhost:9000/my-bucket/file.txt \
+  -H "x-access-key: admin" \
+  -H "x-secret-key: secret123"
+```
+
+## Observability
+
+### Prometheus Metrics
+
+```bash
+# View all metrics
+curl http://localhost:9000/_metrics
+
+# Metrics include:
+# - http_request_duration_seconds
+# - storage_operation_duration_seconds
+# - auth_duration_seconds
+# - multipart_active_uploads
+# - storage_bytes_total
+# ... and 60+ more
+```
+
+### Health Checks
+
+```bash
+# Liveness probe
+curl http://localhost:9000/_health
+
+# Readiness probe (checks backends)
+curl http://localhost:9000/_ready
+```
+
+### Structured Logging
+
+```bash
+# JSON logging for production
+LOG_FORMAT=json RUST_LOG=info ./target/release/s3ish --protocol http
+
+# Human-readable for development
+LOG_FORMAT=human RUST_LOG=debug ./target/release/s3ish --protocol http
+```
+
+See [OBSERVABILITY.md](OBSERVABILITY.md) for detailed metrics documentation.
+
+## Storage Backends
+
+### In-Memory Storage (Default)
+
+Fast ephemeral storage for development and testing.
+
+### Filesystem Storage
+
+Persistent storage with optional erasure coding:
+
+```toml
+# config.toml
+[storage]
+backend = "file"
+path = "./s3-data"
+erasure_coding = true
+data_blocks = 2
+parity_blocks = 1
+```
+
+## Configuration Options
+
+See [API_USAGE.md](API_USAGE.md) for complete configuration reference.
+
 ## Next Steps
 
-- Implement AWS S3 signature authentication
-- Add support for multipart uploads
-- Implement bucket listing (list all buckets)
-- Add object metadata support
-- Support for object versioning
-- Implement lifecycle policies
+- Object versioning support
+- Lifecycle policies
+- Bucket policies and ACLs
+- Server-side encryption
+- Replication

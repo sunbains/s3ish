@@ -28,3 +28,11 @@
 - 2025-12-16: Wired storage selection via config (file vs in-memory), added FileStorage HTTP integration test, and extended filesystem tests (list/copy/delete); tests/clippy remain clean. Tests/Lints: `cargo test`, `cargo clippy`.
 - 2025-12-16: Made FileStorage CopyObject streaming by copying shard files directly (no full-buffering), added a large-object streaming copy test, and kept lints/tests clean. Tests/Lints: `cargo test`, `cargo clippy`.
 - 2025-12-16: Added S3 multi-object delete (`POST /{bucket}?delete`) with XML responses, quiet mode, and new unit tests covering deletion and quiet behavior; suites remain green. Tests/Lints: `cargo test`, `cargo clippy`.
+- 2025-12-16: Implemented comprehensive observability features:
+  - Added 66+ Prometheus metrics covering HTTP, gRPC, authentication, storage, erasure coding, and multipart uploads
+  - Implemented structured logging with JSON and human-readable output formats
+  - Added health and readiness probes (`/_health`, `/_ready`)
+  - Created Grafana dashboard template (grafana-dashboard.json)
+  - Added performance profiling metrics including SigV4 stage duration and lock contention tracking
+  - Documented all observability features in OBSERVABILITY.md
+  - Tests/Lints: `cargo test --test observability_integration_test`, `cargo clippy`

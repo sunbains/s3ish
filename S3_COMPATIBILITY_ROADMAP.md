@@ -6,6 +6,7 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 
 ### ✅ Completed (Production-Ready)
 - **AWS SigV4 Authentication** - Full implementation with performance profiling
+- **Pre-signed URLs** - Query string auth with expiration validation (up to 7 days)
 - **XML Response Format** - Complete S3-compliant XML for all operations
 - **S3-Compatible Endpoints** - All major endpoints (path-style)
 - **S3 Headers Support** - Comprehensive request/response header handling
@@ -20,7 +21,7 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 - **Content-MD5 Validation** - Integrity checking for uploads
 
 ### 🚧 Partial / In Progress
-- **Pre-signed URLs** - SigV4 query string auth not yet implemented
+- None currently
 
 ### ❌ Not Yet Implemented
 - **Object Versioning** - Not implemented
@@ -33,7 +34,7 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 
 ### 1.1 AWS Signature V4 Authentication ✅ COMPLETED
 **Status:** ✅ Fully implemented
-**Details:** Full AWS SigV4 implementation with performance profiling
+**Details:** Full AWS SigV4 implementation with performance profiling and pre-signed URLs
 
 ```rust
 // Implemented:
@@ -43,12 +44,14 @@ This document outlines the path to full S3 compatibility for s3ish. Many core fe
 - [x] Calculate string to sign
 - [x] Verify HMAC-SHA256 signature
 - [x] Stage-by-stage performance profiling metrics
-- [ ] Support query string authentication (pre-signed URLs) - NOT YET
+- [x] Support query string authentication (pre-signed URLs)
+- [x] Pre-signed URL expiration validation (max 7 days)
+- [x] Generate pre-signed URLs programmatically
 - [x] Handle credential scope validation
 ```
 
-**Implementation:** See `src/s3_http.rs` - SigV4 verification with detailed metrics
-**Impact:** S3 clients (AWS CLI, boto3) can now connect
+**Implementation:** See `src/s3_http.rs` - SigV4 verification with detailed metrics, pre-signed URL support
+**Impact:** S3 clients (AWS CLI, boto3) can now connect, and temporary URLs can be generated for sharing
 
 ### 1.2 XML Response Format ✅ COMPLETED
 **Status:** ✅ Fully implemented

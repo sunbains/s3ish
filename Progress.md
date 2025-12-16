@@ -36,3 +36,14 @@
   - Added performance profiling metrics including SigV4 stage duration and lock contention tracking
   - Documented all observability features in OBSERVABILITY.md
   - Tests/Lints: `cargo test --test observability_integration_test`, `cargo clippy`
+- 2025-12-16: Implemented AWS S3 pre-signed URLs with full query string authentication:
+  - Added query string parameter parsing for X-Amz-Algorithm, X-Amz-Credential, X-Amz-Date, X-Amz-Expires, X-Amz-SignedHeaders, and X-Amz-Signature
+  - Implemented signature verification for pre-signed URLs with canonical query string construction (excludes X-Amz-Signature from canonical form)
+  - Added automatic expiration validation with maximum 7-day limit (AWS S3 compatible)
+  - Created public `generate_presigned_url()` helper function for programmatic URL generation
+  - Support for GET, PUT, DELETE, and HEAD methods with pre-signed URLs
+  - Integrated with existing metrics system (auth_duration, auth_success/failure with "presigned" type)
+  - Added 6 comprehensive tests covering GET/PUT/DELETE operations, invalid signatures, wrong methods, and expiration limits
+  - Updated documentation: API_USAGE.md with examples, README.md features list, S3_COMPATIBILITY_ROADMAP.md marked as completed
+  - Made S3Error enum public to support generate_presigned_url() as a public API
+  - Tests/Lints: `cargo test --test presigned_urls`, `cargo test`, `cargo check`

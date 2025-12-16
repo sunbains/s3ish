@@ -37,6 +37,25 @@ Requests without valid credentials return:
 - Abort: `DELETE /{bucket}/{key}?uploadId=ID`
 - Errors: `NoSuchUpload` (404), `InvalidPart` (400), `NoSuchBucket`/`NoSuchKey`
 
+### Pre-signed URLs
+Pre-signed URLs allow temporary authenticated access to S3 objects without requiring AWS credentials in the request. URLs are signed using AWS Signature V4 and include an expiration time.
+
+**Key Parameters (query string)**:
+- `X-Amz-Algorithm`: Always `AWS4-HMAC-SHA256`
+- `X-Amz-Credential`: `{access_key}/{date}/{region}/s3/aws4_request`
+- `X-Amz-Date`: Timestamp in format `YYYYMMDDTHHMMSSZ`
+- `X-Amz-Expires`: Duration in seconds (max 604800 = 7 days)
+- `X-Amz-SignedHeaders`: Semicolon-separated list of headers (usually `host`)
+- `X-Amz-Signature`: HMAC-SHA256 signature
+
+**Supported Methods**: GET, PUT, DELETE, HEAD
+
+**Features**:
+- No authentication headers needed in the request
+- Automatic expiration validation
+- Full signature verification
+- Compatible with AWS S3 pre-signed URL format
+
 ## Headers Returned
 
 - `x-amz-request-id`, `x-amz-id-2`, `x-amz-bucket-region`
@@ -124,6 +143,46 @@ XML
 curl -X POST "http://localhost:9000/bucket/big.dat?uploadId=$UPLOAD_ID" \
   -H "x-access-key: test" -H "x-secret-key: pass" \
   --data-binary @complete.xml
+```
+
+Pre-signed URLs (programmatic generation):
+```rust
+use s3ish::s3_http::generate_presigned_url;
+
+// Generate a pre-signed URL for GET (1 hour expiration)
+let url = generate_presigned_url(
+    "http://localhost:9000",
+    "my-bucket",
+    "my-file.txt",
+    "GET",
+    3600,  // expires in 1 hour
+    "demo",
+    "demo-secret",
+    "us-east-1",
+    &["host"],
+)?;
+
+// Use the URL - no auth headers needed!
+curl "${url}"
+```
+
+Pre-signed URL for upload:
+```rust
+// Generate a pre-signed URL for PUT
+let upload_url = generate_presigned_url(
+    "http://localhost:9000",
+    "my-bucket",
+    "upload.txt",
+    "PUT",
+    3600,
+    "demo",
+    "demo-secret",
+    "us-east-1",
+    &["host"],
+)?;
+
+// Anyone with this URL can upload within 1 hour
+curl -X PUT "${upload_url}" --data "uploaded content"
 ```
 
 ## Backends

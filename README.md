@@ -128,6 +128,7 @@ Key points about the planned architecture:
 - **Pluggable Architecture**: Easy to swap authentication and storage backends
 - **Multiple Storage Backends**: In-memory and filesystem-based storage with optional erasure coding
 - **AWS SigV4 Authentication**: Full AWS Signature V4 support plus simple header-based auth
+- **Pre-signed URLs**: Generate temporary authenticated URLs with expiration (up to 7 days)
 - **S3-Compatible Operations**: PutObject, GetObject, DeleteObject, CopyObject, ListObjects
 - **Multipart Uploads**: Complete multipart upload support for large objects
 - **Range Requests**: Streaming support with HTTP range headers
@@ -136,7 +137,7 @@ Key points about the planned architecture:
   - Structured logging (JSON/human-readable)
   - Health/readiness probes
   - Grafana dashboard
-- **Comprehensive Tests**: 126+ tests covering all components
+- **Comprehensive Tests**: 132+ tests covering all components
 
 ## Quick Start
 

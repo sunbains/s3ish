@@ -257,6 +257,13 @@ impl S3HttpHandler {
         headers: &HeaderMap,
         payload: &[u8],
     ) -> Result<(), S3Error> {
+        // Pre-signed URL: Check query string parameters first
+        if let Some(presigned) = parse_presigned_params(uri) {
+            self.verify_presigned(method, uri, headers, &presigned)
+                .await?;
+            return Ok(());
+        }
+
         // SigV4: Authorization header present
         if let Some(authz) = headers.get("authorization") {
             let authz = authz.to_str().map_err(|_| S3Error::InvalidCredentials)?;
@@ -400,10 +407,102 @@ impl S3HttpHandler {
 
         Ok(())
     }
+
+    async fn verify_presigned(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &HeaderMap,
+        presigned: &PresignedAuth,
+    ) -> Result<(), S3Error> {
+        let overall_start = std::time::Instant::now();
+
+        // Stage 1: Validate expiration
+        let expiration_start = std::time::Instant::now();
+        let request_time = parse_amz_date(&presigned.amz_date)?;
+        let now = Utc::now();
+        let expiration_time = request_time + chrono::Duration::seconds(presigned.expires as i64);
+
+        if now > expiration_time {
+            metrics::increment_auth_failure("presigned");
+            return Err(S3Error::InvalidCredentials);
+        }
+        metrics::record_sigv4_stage("expiration", expiration_start.elapsed().as_secs_f64());
+
+        // Stage 2: Validate date consistency
+        if !presigned.amz_date.starts_with(&presigned.date) {
+            metrics::increment_auth_failure("presigned");
+            return Err(S3Error::InvalidCredentials);
+        }
+
+        // Stage 3: Build canonical request (payload is always UNSIGNED-PAYLOAD for pre-signed URLs)
+        let canonical_start = std::time::Instant::now();
+        let payload_hash = "UNSIGNED-PAYLOAD";
+        let canonical_request = build_canonical_request_presigned(
+            method,
+            uri,
+            headers,
+            &presigned.signed_headers,
+            payload_hash,
+        )?;
+        let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+        metrics::record_sigv4_stage("canonical", canonical_start.elapsed().as_secs_f64());
+
+        // Stage 4: Build string to sign
+        let sign_build_start = std::time::Instant::now();
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}/{}/{}/aws4_request\n{}",
+            presigned.amz_date,
+            presigned.date,
+            presigned.region,
+            presigned.service,
+            canonical_request_hash
+        );
+        metrics::record_sigv4_stage("string_to_sign", sign_build_start.elapsed().as_secs_f64());
+
+        // Stage 5: Get secret and compute signature
+        let sign_start = std::time::Instant::now();
+        let secret = self
+            .state
+            .handler
+            .auth
+            .secret_for(&presigned.access_key)
+            .await
+            .map_err(|_| S3Error::InvalidCredentials)?;
+
+        // Build a temporary SigV4Authorization for signing
+        let auth_for_signing = SigV4Authorization {
+            access_key: presigned.access_key.clone(),
+            date: presigned.date.clone(),
+            region: presigned.region.clone(),
+            service: presigned.service.clone(),
+            signed_headers: presigned.signed_headers.clone(),
+            signature: String::new(), // Not used
+        };
+
+        let sig = sign_string(&secret, &auth_for_signing, &string_to_sign)?;
+        let computed_signature = hex::encode(sig);
+        metrics::record_sigv4_stage("sign", sign_start.elapsed().as_secs_f64());
+
+        // Stage 6: Verify signature
+        let verify_start = std::time::Instant::now();
+        if computed_signature != presigned.signature {
+            metrics::record_sigv4_stage("verify", verify_start.elapsed().as_secs_f64());
+            metrics::increment_auth_failure("presigned");
+            return Err(S3Error::InvalidCredentials);
+        }
+        metrics::record_sigv4_stage("verify", verify_start.elapsed().as_secs_f64());
+
+        // Record overall auth duration and success
+        metrics::record_auth_duration("presigned", overall_start.elapsed().as_secs_f64());
+        metrics::increment_auth_success("presigned");
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
-enum S3Error {
+pub enum S3Error {
     MissingCredentials,
     InvalidCredentials,
     BucketNotFound(String),
@@ -552,6 +651,69 @@ struct SigV4Authorization {
     signature: String,
 }
 
+/// Pre-signed URL authentication parameters from query string
+#[derive(Debug, Clone)]
+struct PresignedAuth {
+    access_key: String,
+    date: String,
+    region: String,
+    service: String,
+    signed_headers: Vec<String>,
+    signature: String,
+    expires: u64,        // Expiration in seconds
+    amz_date: String,    // Full timestamp (YYYYMMDDTHHMMSSZ)
+}
+
+/// Parse pre-signed URL parameters from query string
+fn parse_presigned_params(uri: &Uri) -> Option<PresignedAuth> {
+    use percent_encoding::percent_decode_str;
+
+    let query = uri.query()?;
+    let mut params: HashMap<String, String> = HashMap::new();
+
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            // URL decode both key and value
+            let key_decoded = percent_decode_str(key).decode_utf8().ok()?.to_string();
+            let value_decoded = percent_decode_str(value).decode_utf8().ok()?.to_string();
+            params.insert(key_decoded, value_decoded);
+        }
+    }
+
+    // Check if this is a pre-signed URL (must have X-Amz-Algorithm)
+    if params.get("X-Amz-Algorithm")?.as_str() != "AWS4-HMAC-SHA256" {
+        return None;
+    }
+
+    // Parse X-Amz-Credential: access_key/date/region/service/aws4_request
+    let credential = params.get("X-Amz-Credential")?;
+    let parts: Vec<&str> = credential.split('/').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+
+    // Parse X-Amz-SignedHeaders
+    let signed_headers_str = params.get("X-Amz-SignedHeaders")?;
+    let signed_headers: Vec<String> = signed_headers_str
+        .split(';')
+        .map(|s| s.to_string())
+        .collect();
+
+    // Parse X-Amz-Expires (duration in seconds)
+    let expires: u64 = params.get("X-Amz-Expires")?.parse().ok()?;
+
+    Some(PresignedAuth {
+        access_key: parts[0].to_string(),
+        date: parts[1].to_string(),
+        region: parts[2].to_string(),
+        service: parts[3].to_string(),
+        signed_headers,
+        signature: params.get("X-Amz-Signature")?.to_string(),
+        expires,
+        amz_date: params.get("X-Amz-Date")?.to_string(),
+    })
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -634,6 +796,45 @@ fn canonical_query(uri: &Uri) -> String {
         .join("&")
 }
 
+/// Canonical query string for pre-signed URLs - excludes X-Amz-Signature
+fn canonical_query_presigned(uri: &Uri) -> String {
+    let Some(query) = uri.query() else {
+        return String::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .filter_map(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            // Exclude X-Amz-Signature from canonical query string
+            if name == "X-Amz-Signature" {
+                None
+            } else {
+                Some((
+                    utf8_percent_encode(name, AWS_ENCODE_SET).to_string(),
+                    utf8_percent_encode(value, AWS_ENCODE_SET).to_string(),
+                ))
+            }
+        })
+        .collect();
+
+    pairs.sort_by(|a, b| {
+        let key_cmp = a.0.cmp(&b.0);
+        if key_cmp == std::cmp::Ordering::Equal {
+            a.1.cmp(&b.1)
+        } else {
+            key_cmp
+        }
+    });
+
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 fn canonical_headers(headers: &HeaderMap, signed_headers: &[String]) -> Result<String, S3Error> {
     let mut out = String::new();
     for name in signed_headers {
@@ -672,6 +873,194 @@ fn build_canonical_request(
         signed_headers_str,
         payload_hash
     ))
+}
+
+/// Build canonical request for pre-signed URLs - uses canonical_query_presigned
+fn build_canonical_request_presigned(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    signed_headers: &[String],
+    payload_hash: &str,
+) -> Result<String, S3Error> {
+    let canonical_uri = canonical_uri(uri.path());
+    let canonical_query = canonical_query_presigned(uri);
+    let canonical_headers = canonical_headers(headers, signed_headers)?;
+    let signed_headers_str = signed_headers.join(";");
+
+    Ok(format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method.as_str(),
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers_str,
+        payload_hash
+    ))
+}
+
+/// Parse AWS timestamp format (YYYYMMDDTHHMMSSZ)
+fn parse_amz_date(date_str: &str) -> Result<DateTime<Utc>, S3Error> {
+    // Format: 20231215T123456Z
+    if date_str.len() != 16 || !date_str.ends_with('Z') {
+        return Err(S3Error::InvalidCredentials);
+    }
+
+    let year: i32 = date_str[0..4]
+        .parse()
+        .map_err(|_| S3Error::InvalidCredentials)?;
+    let month: u32 = date_str[4..6]
+        .parse()
+        .map_err(|_| S3Error::InvalidCredentials)?;
+    let day: u32 = date_str[6..8]
+        .parse()
+        .map_err(|_| S3Error::InvalidCredentials)?;
+    let hour: u32 = date_str[9..11]
+        .parse()
+        .map_err(|_| S3Error::InvalidCredentials)?;
+    let minute: u32 = date_str[11..13]
+        .parse()
+        .map_err(|_| S3Error::InvalidCredentials)?;
+    let second: u32 = date_str[13..15]
+        .parse()
+        .map_err(|_| S3Error::InvalidCredentials)?;
+
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()
+        .ok_or(S3Error::InvalidCredentials)
+}
+
+/// Generate a pre-signed URL for S3 operations
+///
+/// # Arguments
+/// * `endpoint` - The S3 endpoint (e.g., "http://localhost:9000")
+/// * `bucket` - The bucket name
+/// * `key` - The object key
+/// * `method` - HTTP method (GET, PUT, DELETE, etc.)
+/// * `expires_in_secs` - Duration in seconds until the URL expires (max 604800 = 7 days)
+/// * `access_key` - AWS access key
+/// * `secret_key` - AWS secret key
+/// * `region` - AWS region (e.g., "us-east-1")
+/// * `signed_headers` - List of headers to include in signature (usually just "host")
+///
+/// # Returns
+/// A fully-formed pre-signed URL that can be used to access the S3 object
+///
+/// # Example
+/// ```ignore
+/// let url = generate_presigned_url(
+///     "http://localhost:9000",
+///     "my-bucket",
+///     "my-file.txt",
+///     "GET",
+///     3600,
+///     "demo",
+///     "demo-secret",
+///     "us-east-1",
+///     &["host"],
+/// )?;
+/// ```
+pub fn generate_presigned_url(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    method: &str,
+    expires_in_secs: u64,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    signed_headers: &[&str],
+) -> Result<String, S3Error> {
+    // AWS limits pre-signed URL expiration to 7 days
+    if expires_in_secs > 604800 {
+        return Err(S3Error::InvalidInput(
+            "Expiration must be <= 604800 seconds (7 days)".to_string(),
+        ));
+    }
+
+    let now = Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_short = now.format("%Y%m%d").to_string();
+
+    // Build the URL path
+    let path = format!("/{}/{}", bucket, key);
+    let signed_headers_str = signed_headers.join(";");
+
+    // Build credential scope
+    let credential = format!(
+        "{}/{}/{}/s3/aws4_request",
+        access_key, date_short, region
+    );
+
+    // Build query string (without signature)
+    let mut query_params = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        ("X-Amz-Credential", credential.clone()),
+        ("X-Amz-Date", amz_date.clone()),
+        ("X-Amz-Expires", expires_in_secs.to_string()),
+        ("X-Amz-SignedHeaders", signed_headers_str.clone()),
+    ];
+
+    // Sort query parameters for canonical query string
+    query_params.sort_by(|a, b| a.0.cmp(&b.0));
+    let canonical_query_str = query_params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                utf8_percent_encode(k, AWS_ENCODE_SET),
+                utf8_percent_encode(v, AWS_ENCODE_SET)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    // Build canonical headers
+    let host = endpoint.trim_start_matches("http://").trim_start_matches("https://");
+    let canonical_headers = format!("host:{}\n", host);
+
+    // Build canonical request
+    let canonical_uri = canonical_uri(&path);
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method,
+        canonical_uri,
+        canonical_query_str,
+        canonical_headers,
+        signed_headers_str,
+        payload_hash
+    );
+
+    // Build string to sign
+    let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{}/{}/s3/aws4_request\n{}",
+        amz_date, date_short, region, canonical_request_hash
+    );
+
+    // Calculate signature
+    let auth = SigV4Authorization {
+        access_key: access_key.to_string(),
+        date: date_short,
+        region: region.to_string(),
+        service: "s3".to_string(),
+        signed_headers: signed_headers.iter().map(|s| s.to_string()).collect(),
+        signature: String::new(),
+    };
+    let sig = sign_string(secret_key, &auth, &string_to_sign)?;
+    let signature = hex::encode(sig);
+
+    // Build final URL with signature
+    let final_url = format!(
+        "{}{}?{}&X-Amz-Signature={}",
+        endpoint,
+        path,
+        canonical_query_str,
+        signature
+    );
+
+    Ok(final_url)
 }
 
 fn format_rfc3339(ts: i64) -> String {

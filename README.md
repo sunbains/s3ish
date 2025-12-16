@@ -2,6 +2,117 @@
 
 In-memory S3-like object store with pluggable gRPC and HTTP interfaces.
 
+## Project Vision: S3 Tiered Storage Engine
+
+This project is building toward a **log-authoritative tiered storage architecture** - a design that looks like an S3 proxy on the surface, but is fundamentally something different.
+
+### The Core Principle
+
+**The Raft log is the source of truth.**
+**The Raft low-water mark becomes the S3 high-water mark.**
+
+Unlike traditional S3 proxies where S3 is authoritative and the proxy adds caching, this architecture inverts the relationship:
+
+```
+           ┌──────────────────┐
+           │   Raft Log       │
+           │ (Source of Truth)│
+           └────────┬─────────┘
+                    |
+                    v
+        ┌────────────────────────────┐
+        │ Local ARIES Storage Engine │
+        │  - buffer pool             │
+        │  - redo / undo             │
+        │  - hot working set (~10%)  │
+        └───────────┬────────────────┘
+                    |
+           WAL / segment shipping
+                    |
+                    v
+        ┌─────────────────────────────┐
+        │           S3                │
+        │  immutable objects          │
+        │  cold tier                  │
+        └─────────────────────────────┘
+```
+
+### The Key Invariant
+
+The entire system is defined by a single invariant:
+
+**Raft Low-Water Mark (LWM) = S3 High-Water Mark (HWM)**
+
+```
+LSN timeline
+│
+├── ≤ S3_HWM   → safely stored in S3
+├── ≤ Raft_LWM → applied everywhere
+└── > S3_HWM   → may exist only in hot storage
+```
+
+### Why This Is Not an S3 Proxy
+
+| Aspect | Traditional S3 Proxy | This Design |
+|--------|---------------------|-------------|
+| **Source of Truth** | S3 | Raft Log |
+| **Local State** | Cache | ARIES Storage Engine |
+| **S3 Role** | Authoritative | Derived, Monotonic Materialization |
+| **Correctness** | Depends on cache coherence | Independent of S3 |
+| **Writes** | Synchronously wait for S3 | S3 shipping is asynchronous |
+
+### Relationship to ARIES
+
+The local storage engine follows classic ARIES principles:
+- Write-ahead logging
+- Redo for durability
+- Undo for rollback
+
+The WAL has two consumers:
+```
+Raft Log Entry
+     |
+     +--> Local redo / undo
+     |
+     +--> Background S3 shipping
+```
+
+S3 objects are created via:
+- Log segment sealing
+- Compaction output
+- Checkpoint materialization
+
+### Failure and Recovery
+
+**Crash Recovery:**
+1. Replay Raft log
+2. Recover hot tier
+3. Fetch cold segments from S3 as needed
+
+**Disk Loss:**
+- Raft provides ordering
+- S3 provides historical state
+- Rehydration is deterministic
+
+**S3 Lag:**
+- Explicitly allowed
+- Bounded by Raft LWM
+- Never affects correctness
+
+### Classification
+
+This system belongs to a new class of storage systems:
+
+**Log-authoritative, consensus-replicated storage engine with tiered persistence.**
+
+Once you decide that the Raft log is the source of truth, everything else becomes an optimization. S3 stops being a cache target and becomes a materialized view of history.
+
+---
+
+## Current Status
+
+The current implementation provides the S3-compatible foundation layer with pluggable storage backends. The Raft log and ARIES-based storage engine are planned future enhancements.
+
 ## Features
 
 - **Dual Protocol Support**: gRPC and S3-compatible HTTP APIs

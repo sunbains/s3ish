@@ -1,0 +1,19 @@
+# Performance test configuration
+listen_addr = "127.0.0.1:9999"
+auth_file = "./creds.txt"
+region = "us-east-1"
+
+[storage]
+backend = "file"
+path = "./perf-test-data"
+
+[storage.erasure]
+# Number of data blocks (shards) per object
+data_blocks = 4
+# Number of parity blocks for redundancy/recovery
+parity_blocks = 1
+# Block size in bytes (1 MB = 1048576 bytes)
+block_size = 1048576
+
+[lifecycle]
+enabled = false

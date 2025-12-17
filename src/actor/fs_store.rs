@@ -91,8 +91,8 @@ async fn read_stored_meta(meta_path: &Path) -> Result<StoredMeta, StorageError> 
 /// Processes filesystem operations sequentially. All state is private
 /// to this actor, so no locks are needed.
 pub struct FsStoreActor {
-    /// Root directory for storage
-    root: PathBuf,
+    /// Storage drives (for multi-drive sharding)
+    drives: Vec<PathBuf>,
 
     /// Erasure coding configuration (immutable)
     erasure: Erasure,
@@ -107,30 +107,54 @@ pub struct FsStoreActor {
 impl FsStoreActor {
     /// Create a new FsStoreActor
     pub fn new(
-        root: PathBuf,
+        drives: Vec<PathBuf>,
         data_blocks: usize,
         parity_blocks: usize,
         rx: mpsc::Receiver<FsCommand>,
         metrics: Arc<Metrics>,
     ) -> Self {
+        assert!(!drives.is_empty(), "At least one drive required");
+
         let erasure = Erasure::new(data_blocks, parity_blocks, ERASURE_CHUNK_SIZE)
             .expect("Failed to create erasure coding");
 
         Self {
-            root,
+            drives,
             erasure,
             rx,
             metrics,
         }
     }
 
+    // Multi-drive helper methods
+    fn primary_drive(&self) -> &Path {
+        &self.drives[0]
+    }
+
+    fn drive_for_shard(&self, shard_index: usize) -> &Path {
+        let drive_index = shard_index % self.drives.len();
+        &self.drives[drive_index]
+    }
+
     // Path helper methods
     fn bucket_path(&self, bucket: &str) -> PathBuf {
-        self.root.join(bucket)
+        self.primary_drive().join(bucket)
+    }
+
+    fn bucket_path_on_drive(&self, drive: &Path, bucket: &str) -> PathBuf {
+        drive.join(bucket)
     }
 
     fn object_path(&self, bucket: &str, key: &str) -> PathBuf {
         let mut path = self.bucket_path(bucket);
+        for comp in key.split('/') {
+            path.push(comp);
+        }
+        path
+    }
+
+    fn object_path_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
+        let mut path = self.bucket_path_on_drive(drive, bucket);
         for comp in key.split('/') {
             path.push(comp);
         }
@@ -158,12 +182,32 @@ impl FsStoreActor {
         p
     }
 
+    fn shard_dir_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
+        let obj_path = self.object_path_on_drive(drive, bucket, key);
+        let mut p = obj_path;
+        let file_name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("obj")
+            .to_string();
+        p.set_file_name(format!("{file_name}.shards"));
+        p
+    }
+
     /// Run the actor event loop
     ///
     /// This processes messages sequentially, so no locks are needed.
     /// The actor stops when the channel is closed.
     pub async fn run(mut self) {
-        tracing::info!("FsStoreActor started, root={}", self.root.display());
+        tracing::info!(
+            "FsStoreActor started, drives={} ({})",
+            self.drives.len(),
+            self.drives
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         while let Some(cmd) = self.rx.recv().await {
             self.metrics.inc_message_received();
@@ -277,7 +321,7 @@ impl FsStoreActor {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
 
-        // Get object paths
+        // Get object paths (metadata goes on primary drive)
         let obj_path = self.object_path(bucket, key);
         if let Some(parent) = obj_path.parent() {
             fs::create_dir_all(parent)
@@ -285,24 +329,36 @@ impl FsStoreActor {
                 .map_err(|e| StorageError::Internal(format!("create parents: {e}")))?;
         }
 
-        let shard_dir = self.shard_dir(&obj_path);
         let meta_path = self.meta_path(&obj_path);
-
-        // Create shard directory
-        fs::create_dir_all(&shard_dir)
-            .await
-            .map_err(|e| StorageError::Internal(format!("create shard dir: {e}")))?;
 
         let parity_blocks = self.erasure.parity_blocks.max(1);
         let shard_count = self.erasure.data_blocks + parity_blocks;
 
-        // Open buffered writers for all shards
+        // Open buffered writers for all shards, each on its designated drive
         let mut files = Vec::new();
         for idx in 0..shard_count {
+            let drive = self.drive_for_shard(idx);
+            let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+
+            // Create shard directory on this drive
+            fs::create_dir_all(&shard_dir)
+                .await
+                .map_err(|e| {
+                    StorageError::Internal(format!(
+                        "create shard dir on {:?}: {e}",
+                        drive
+                    ))
+                })?;
+
             let shard_path = shard_dir.join(format!("{}", idx));
             let file = fs::File::create(&shard_path)
                 .await
-                .map_err(|e| StorageError::Internal(format!("create shard {}: {}", idx, e)))?;
+                .map_err(|e| {
+                    StorageError::Internal(format!(
+                        "create shard {} on {:?}: {}",
+                        idx, drive, e
+                    ))
+                })?;
             files.push(BufWriter::new(file));
         }
 
@@ -445,8 +501,6 @@ impl FsStoreActor {
         pb: usize,
         size: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        let obj_path = self.object_path(bucket, key);
-        let shard_dir = self.shard_dir(&obj_path);
         let total = db + pb.max(1);
 
         let mut out = Vec::with_capacity(size as usize);
@@ -455,11 +509,14 @@ impl FsStoreActor {
         let mut offset = 0usize;
 
         while offset < size as usize {
-            // Read all shards for this block
+            // Read all shards for this block from their designated drives
             let mut blocks: Vec<Option<Vec<u8>>> = vec![None; db];
 
             for (idx, block) in blocks.iter_mut().enumerate().take(db) {
+                let drive = self.drive_for_shard(idx);
+                let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
                 let shard_path = shard_dir.join(format!("{}", idx));
+
                 match fs::read(&shard_path).await {
                     Ok(data) => {
                         let start = (offset / size as usize) * block_size;
@@ -470,14 +527,20 @@ impl FsStoreActor {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
-                        return Err(StorageError::Internal(format!("read shard {}: {}", idx, e)))
+                        return Err(StorageError::Internal(format!(
+                            "read shard {} from {:?}: {}",
+                            idx, drive, e
+                        )))
                     }
                 }
             }
 
-            // Read parity shard
+            // Read parity shard from its designated drive
             let parity_idx = total - 1;
-            let parity_path = shard_dir.join(format!("{}", parity_idx));
+            let parity_drive = self.drive_for_shard(parity_idx);
+            let parity_shard_dir = self.shard_dir_on_drive(parity_drive, bucket, key);
+            let parity_path = parity_shard_dir.join(format!("{}", parity_idx));
+
             let parity_block = match fs::read(&parity_path).await {
                 Ok(data) => {
                     let start = (offset / size as usize) * block_size;
@@ -571,7 +634,6 @@ impl FsStoreActor {
 
         let obj_path = self.object_path(bucket, key);
         let meta_path = self.meta_path(&obj_path);
-        let shard_dir = self.shard_dir(&obj_path);
 
         // Check if object exists
         if fs::metadata(&meta_path).await.is_err() {
@@ -581,8 +643,11 @@ impl FsStoreActor {
         // Delete metadata file
         let _ = fs::remove_file(&meta_path).await;
 
-        // Delete shard directory
-        let _ = fs::remove_dir_all(&shard_dir).await;
+        // Delete shard directories from all drives
+        for drive in &self.drives {
+            let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+            let _ = fs::remove_dir_all(&shard_dir).await;
+        }
 
         // Update metrics
         self.metrics.inc_delete();
@@ -711,7 +776,7 @@ impl FsStoreActor {
 
     async fn handle_list_buckets(&self) -> Result<Vec<String>, StorageError> {
         let mut buckets = Vec::new();
-        let mut entries = match fs::read_dir(&self.root).await {
+        let mut entries = match fs::read_dir(self.primary_drive()).await {
             Ok(e) => e,
             Err(e) => return Err(StorageError::Internal(format!("read root dir: {}", e))),
         };

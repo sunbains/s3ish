@@ -72,14 +72,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let actor_metrics = Arc::new(ActorMetrics::new());
             let (fs_tx, fs_rx) = mpsc::channel(10000);
 
-            let root = cfg.storage.effective_drives()
+            // Use all configured drives for multi-drive sharding
+            let drives: Vec<std::path::PathBuf> = cfg
+                .storage
+                .effective_drives()
                 .into_iter()
-                .next()
-                .expect("At least one drive required")
-                .into();
+                .map(|s| s.into())
+                .collect();
 
             let actor = FsStoreActor::new(
-                root,
+                drives,
                 cfg.storage.erasure.data_blocks,
                 cfg.storage.erasure.parity_blocks,
                 fs_rx,
@@ -87,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             tokio::spawn(actor.run());
-            tracing::info!("FsStoreActor started (actor model)");
+            tracing::info!("FsStoreActor started (actor model, multi-drive)");
 
             Arc::new(ActorStorageBackend::new(fs_tx))
         }

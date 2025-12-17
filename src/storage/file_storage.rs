@@ -987,7 +987,7 @@ impl StorageBackend for FileStorage {
             let stripe_data_len = stripe_end - stripe_start;
 
             // Distribute stripe data evenly across shards
-            let chunk_size = (stripe_data_len + self.erasure.data_blocks - 1) / self.erasure.data_blocks;
+            let chunk_size = stripe_data_len.div_ceil(self.erasure.data_blocks);
 
             for data_idx in 0..self.erasure.data_blocks {
                 let shard_idx = data_idx;
@@ -1003,7 +1003,7 @@ impl StorageBackend for FileStorage {
 
                 // Pad to 4KB page boundary for optimal I/O
                 const PAGE_SIZE: usize = 4096;
-                let padded_len = ((slice.len() + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+                let padded_len = slice.len().div_ceil(PAGE_SIZE) * PAGE_SIZE;
 
                 // Write data
                 files[shard_idx]
@@ -1030,7 +1030,7 @@ impl StorageBackend for FileStorage {
             // parity shards (identical XOR parity for each parity slot)
             // Pad parity to 4KB page boundary for optimal I/O
             const PAGE_SIZE: usize = 4096;
-            let parity_padded_len = ((parity_block.len() + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+            let parity_padded_len = parity_block.len().div_ceil(PAGE_SIZE) * PAGE_SIZE;
 
             for parity_file in files
                 .iter_mut()

@@ -22,6 +22,8 @@ use crate::storage::{ObjectMetadata, StorageBackend, StorageError, VersioningSta
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use crossbeam_queue::ArrayQueue;
+use once_cell::sync::Lazy;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -32,11 +34,92 @@ const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks for simulated eras
 // Using 256 shards allows up to 256 concurrent write operations
 const NUM_SHARDS: usize = 256;
 
+// Global object pool for zero-copy ObjectMetadata reuse
+// Bounded queue prevents unbounded memory growth
+const POOL_SIZE: usize = 10000;
+static METADATA_POOL: Lazy<ArrayQueue<ObjectMetadata>> = Lazy::new(|| {
+    let pool = ArrayQueue::new(POOL_SIZE);
+
+    // Pre-populate pool with instances that have pre-allocated capacity
+    for _ in 0..POOL_SIZE {
+        let _ = pool.push(ObjectMetadata {
+            content_type: String::with_capacity(128),
+            etag: String::with_capacity(64),
+            size: 0,
+            last_modified_unix_secs: 0,
+            metadata: HashMap::with_capacity(8),
+            storage_class: None,
+            server_side_encryption: None,
+            version_id: None,
+            is_latest: true,
+            is_delete_marker: false,
+        });
+    }
+
+    pool
+});
+
+/// Get ObjectMetadata from global pool (zero-copy) or allocate new
+#[inline]
+fn get_pooled_metadata(
+    content_type: String,
+    etag: String,
+    size: u64,
+    last_modified_unix_secs: i64,
+    metadata: HashMap<String, String>,
+    storage_class: Option<String>,
+    server_side_encryption: Option<String>,
+    version_id: Option<String>,
+    is_latest: bool,
+    is_delete_marker: bool,
+) -> ObjectMetadata {
+    match METADATA_POOL.pop() {
+        Some(mut meta) => {
+            // Reuse with pre-allocated strings (zero-copy reuse)
+            meta.content_type.clear();
+            meta.content_type.push_str(&content_type);
+            meta.etag.clear();
+            meta.etag.push_str(&etag);
+            meta.size = size;
+            meta.last_modified_unix_secs = last_modified_unix_secs;
+            meta.metadata.clear();
+            meta.metadata.extend(metadata);
+            meta.storage_class = storage_class;
+            meta.server_side_encryption = server_side_encryption;
+            meta.version_id = version_id;
+            meta.is_latest = is_latest;
+            meta.is_delete_marker = is_delete_marker;
+            meta
+        }
+        None => {
+            // Pool exhausted, allocate new with capacity
+            ObjectMetadata {
+                content_type,
+                etag,
+                size,
+                last_modified_unix_secs,
+                metadata,
+                storage_class,
+                server_side_encryption,
+                version_id,
+                is_latest,
+                is_delete_marker,
+            }
+        }
+    }
+}
+
+/// Return ObjectMetadata to global pool for reuse (best effort)
+#[inline]
+fn return_pooled_metadata(meta: ObjectMetadata) {
+    let _ = METADATA_POOL.push(meta);
+}
+
 #[derive(Debug, Clone)]
 struct StoredObject {
     shards: Vec<Bytes>,
     orig_len: usize,
-    meta: ObjectMetadata,
+    meta: Arc<ObjectMetadata>,
 }
 
 /// In-memory storage implementation with sharded locks for high concurrency.
@@ -140,7 +223,7 @@ impl VersionStorage for InMemoryStorage {
         let stored_obj = StoredObject {
             shards: vec![], // Data shards are stored separately via put_object
             orig_len: metadata.size as usize,
-            meta: metadata.to_object_metadata(metadata.created_at),
+            meta: Arc::new(metadata.to_object_metadata(metadata.created_at)),
         };
 
         if let Some(versions) = objs.get_mut(&obj_key) {
@@ -356,23 +439,24 @@ impl StorageBackend for InMemoryStorage {
             None
         };
 
-        let meta = ObjectMetadata {
-            content_type: content_type.to_string(),
+        let meta = get_pooled_metadata(
+            content_type.to_string(),
             etag,
             size,
-            last_modified_unix_secs: Utc::now().timestamp(),
+            Utc::now().timestamp(),
             metadata,
             storage_class,
             server_side_encryption,
             version_id,
-            is_latest: true,
-            is_delete_marker: false,
-        };
+            true,
+            false,
+        );
 
+        let meta_for_return = meta.clone();
         let stored_obj = StoredObject {
             shards,
             orig_len,
-            meta: meta.clone(),
+            meta: Arc::new(meta),
         };
 
         // Allocate key before acquiring lock to minimize lock hold time
@@ -391,7 +475,7 @@ impl StorageBackend for InMemoryStorage {
             // This avoids dropping and re-acquiring the lock, reducing contention
             if let Some(versions) = objs.get_mut(&obj_key) {
                 for v in versions.iter_mut() {
-                    v.meta.is_latest = false;
+                    Arc::make_mut(&mut v.meta).is_latest = false;
                 }
                 versions.push(stored_obj);
             } else {
@@ -414,7 +498,7 @@ impl StorageBackend for InMemoryStorage {
             "Put object completed"
         );
 
-        Ok(meta)
+        Ok(meta_for_return)
     }
 
     #[tracing::instrument(skip(self), fields(bucket = %bucket, key = %key))]
@@ -476,7 +560,7 @@ impl StorageBackend for InMemoryStorage {
             "Get object completed"
         );
 
-        Ok((data, obj.meta.clone()))
+        Ok((data, (*obj.meta).clone()))
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, StorageError> {
@@ -509,7 +593,7 @@ impl StorageBackend for InMemoryStorage {
                 key: key.to_string(),
             })?;
 
-        Ok(obj.meta.clone())
+        Ok((*obj.meta).clone())
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
@@ -572,7 +656,7 @@ impl StorageBackend for InMemoryStorage {
                     .rev()
                     .find(|v| v.meta.is_latest && !v.meta.is_delete_marker)
                 {
-                    out.push((k.clone(), latest.meta.clone()));
+                    out.push((k.clone(), (*latest.meta).clone()));
                 }
 
                 if out.len() >= limit {
@@ -625,23 +709,24 @@ impl StorageBackend for InMemoryStorage {
             None
         };
 
-        let meta = ObjectMetadata {
-            content_type: content_type.to_string(),
+        let meta = get_pooled_metadata(
+            content_type.to_string(),
             etag,
-            size: data.len() as u64,
-            last_modified_unix_secs: Utc::now().timestamp(),
+            data.len() as u64,
+            Utc::now().timestamp(),
             metadata,
             storage_class,
             server_side_encryption,
             version_id,
-            is_latest: true,
-            is_delete_marker: false,
-        };
+            true,
+            false,
+        );
 
+        let meta_for_return = meta.clone();
         let stored_obj = StoredObject {
             shards,
             orig_len,
-            meta: meta.clone(),
+            meta: Arc::new(meta),
         };
 
         let obj_key = (dest_bucket.to_string(), dest_key.to_string());
@@ -654,7 +739,7 @@ impl StorageBackend for InMemoryStorage {
             // Mark all previous versions as not latest
             if let Some(versions) = objs.get_mut(&obj_key) {
                 for v in versions.iter_mut() {
-                    v.meta.is_latest = false;
+                    Arc::make_mut(&mut v.meta).is_latest = false;
                 }
                 versions.push(stored_obj);
             } else {
@@ -665,7 +750,7 @@ impl StorageBackend for InMemoryStorage {
             objs.insert(obj_key, vec![stored_obj]);
         }
 
-        Ok(meta)
+        Ok(meta_for_return)
     }
 
     async fn initiate_multipart(
@@ -894,7 +979,7 @@ impl StorageBackend for InMemoryStorage {
 
                 // Include ALL versions (including delete markers) in reverse chronological order
                 for version in versions.iter().rev() {
-                    out.push(version.meta.clone());
+                    out.push((*version.meta).clone());
                     if out.len() >= limit {
                         return Ok(out);
                     }

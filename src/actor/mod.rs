@@ -13,19 +13,18 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
-pub mod actor;
-pub mod auth;
-pub mod config;
-pub mod handler;
-pub mod observability;
-pub mod pb;
-pub mod s3_http;
-pub mod server;
-pub mod service;
-pub mod storage;
+//! Actor-based architecture for s3ish
+//!
+//! This module implements an actor model where all shared state is eliminated
+//! in favor of message passing through lock-free channels. Actors process
+//! messages sequentially, avoiding lock contention entirely.
 
-pub use actor::{ActorStorageBackend, FsStoreActor, Metrics as ActorMetrics};
-pub use auth::{AuthContext, Authenticator};
-pub use handler::BaseHandler;
-pub use s3_http::S3HttpHandler;
-pub use storage::{ObjectMetadata, StorageBackend};
+pub mod backend;
+pub mod fs_store;
+pub mod messages;
+pub mod metrics;
+
+pub use backend::ActorStorageBackend;
+pub use fs_store::FsStoreActor;
+pub use messages::{FsCommand, ObjectHeaders};
+pub use metrics::Metrics;

@@ -14,6 +14,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 use clap::Parser;
+use s3ish::actor::{ActorStorageBackend, FsStoreActor, Metrics as ActorMetrics};
 use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
 use s3ish::config::Config;
@@ -21,11 +22,11 @@ use s3ish::handler::BaseHandler;
 use s3ish::observability::tracing_setup;
 use s3ish::s3_http::ResponseContext;
 use s3ish::server::{ConnectionManager, GrpcConnectionManager, S3HttpConnectionManager};
-use s3ish::storage::file_storage::FileStorage;
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(name = "s3ish")]
@@ -64,38 +65,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared components
     let auth_file = args.auth_file.as_ref().unwrap_or(&cfg.auth_file);
     let auth: Arc<dyn Authenticator> = Arc::new(FileAuthenticator::new(auth_file).await?);
+
+    // Initialize actor system and storage
     let storage: Arc<dyn StorageBackend> = match cfg.storage.backend.as_str() {
         "file" => {
-            // Use multi-drive configuration if provided, otherwise fall back to single path
-            let drives: Vec<std::path::PathBuf> = cfg.storage.effective_drives()
+            let actor_metrics = Arc::new(ActorMetrics::new());
+            let (fs_tx, fs_rx) = mpsc::channel(10000);
+
+            let root = cfg.storage.effective_drives()
                 .into_iter()
-                .map(|s| s.into())
-                .collect();
+                .next()
+                .expect("At least one drive required")
+                .into();
 
-            // Convert config::CacheConfig to writeback_cache::CacheConfig
-            let cache_config = s3ish::storage::writeback_cache::CacheConfig {
-                enabled: cfg.storage.cache.enabled,
-                flush_interval_secs: cfg.storage.cache.flush_interval_secs,
-                flush_threshold_bytes: cfg.storage.cache.flush_threshold_bytes,
-            };
-
-            // Convert optional metadata_drive path
-            let metadata_drive = cfg.storage.metadata_drive.as_ref().map(|s| s.into());
-
-            let fs = FileStorage::new_multi_drive_full(
-                drives,
-                metadata_drive,
+            let actor = FsStoreActor::new(
+                root,
                 cfg.storage.erasure.data_blocks,
                 cfg.storage.erasure.parity_blocks,
-                cfg.storage.erasure.block_size,
-                cache_config,
-                cfg.storage.io.write_buffer_size,
-                cfg.storage.io.read_buffer_size,
-            ).await?;
-            Arc::new(fs)
+                fs_rx,
+                actor_metrics.clone(),
+            );
+
+            tokio::spawn(actor.run());
+            tracing::info!("FsStoreActor started (actor model)");
+
+            Arc::new(ActorStorageBackend::new(fs_tx))
         }
         _ => Arc::new(InMemoryStorage::new()),
     };
+
     let handler = BaseHandler::new(auth, storage.clone());
     let response_ctx = ResponseContext::new(cfg.region.clone(), cfg.request_id_prefix.clone());
 

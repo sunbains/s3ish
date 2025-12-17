@@ -307,7 +307,14 @@ impl S3HttpHandler {
                     .post(delete_objects)
                     .head(head_bucket),
             )
-            .route("/:bucket/", get(list_objects).head(head_bucket).post(post_bucket))
+            .route(
+                "/:bucket/",
+                get(list_objects)
+                    .head(head_bucket)
+                    .post(post_bucket)
+                    .put(create_bucket)
+                    .delete(delete_bucket),
+            )
             .route(
                 "/:bucket/*key",
                 post(post_object)

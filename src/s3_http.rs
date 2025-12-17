@@ -1,11 +1,27 @@
+// Copyright PingCAP Inc. 2025.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
 use crate::auth::AuthError;
 use crate::handler::BaseHandler;
 use crate::observability::{health, metrics};
 use crate::storage::StorageError;
 use axum::{
     body::Body,
-    extract::{OriginalUri, Path, Query, State},
+    extract::{OriginalUri, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
@@ -93,29 +109,22 @@ fn global_response_context() -> &'static ResponseContext {
 /// - Host is "localhost" without subdomain
 /// - Host doesn't match expected patterns
 fn extract_bucket_from_host(host: &str) -> Option<String> {
+    // Strip port if present
+    let host_without_port = host.split(':').next().unwrap_or(host);
+
     // Skip if host is just an IP address or localhost
-    if host.parse::<std::net::IpAddr>().is_ok() || host == "localhost" {
+    if host_without_port.parse::<std::net::IpAddr>().is_ok()
+        || host_without_port == "localhost"
+    {
         return None;
     }
 
     // Split host by dots
-    let parts: Vec<&str> = host.split('.').collect();
+    let parts: Vec<&str> = host_without_port.split('.').collect();
 
     if parts.is_empty() {
         return None;
     }
-
-    // If host has a port, remove it from the last part
-    let last_part = parts.last().unwrap();
-    let host_without_port = if last_part.contains(':') {
-        // Reconstruct without port
-        let mut new_parts = parts.clone();
-        let last = new_parts.last_mut().unwrap();
-        *last = last.split(':').next().unwrap();
-        new_parts
-    } else {
-        parts.clone()
-    };
 
     // Pattern matching for various virtual-hosted styles:
     // - bucket.s3.amazonaws.com
@@ -124,26 +133,25 @@ fn extract_bucket_from_host(host: &str) -> Option<String> {
     // - bucket.localhost
     // - bucket.custom-domain.com
 
-    // If there's only one part before the port removal, no bucket
-    if host_without_port.len() < 2 {
+    // If there's only one part, no bucket
+    if parts.len() < 2 {
         return None;
     }
 
     // Check for S3-style patterns
-    if host_without_port.len() >= 3 {
+    if parts.len() >= 3 {
         // Check if it's s3.amazonaws.com or s3.region.amazonaws.com pattern
-        if (host_without_port[1] == "s3" || host_without_port[1].starts_with("s3-"))
-            && (host_without_port.last() == Some(&"com")
-                || host_without_port.last() == Some(&"amazonaws"))
+        if (parts[1] == "s3" || parts[1].starts_with("s3-"))
+            && (parts.last() == Some(&"com") || parts.last() == Some(&"amazonaws"))
         {
             // First part is the bucket
-            return Some(host_without_port[0].to_string());
+            return Some(parts[0].to_string());
         }
     }
 
     // For localhost or custom domains: bucket.domain.tld
     // First part is the bucket
-    Some(host_without_port[0].to_string())
+    Some(parts[0].to_string())
 }
 
 impl S3State {
@@ -299,7 +307,7 @@ impl S3HttpHandler {
                     .post(delete_objects)
                     .head(head_bucket),
             )
-            .route("/:bucket/", get(list_objects))
+            .route("/:bucket/", get(list_objects).head(head_bucket))
             .route(
                 "/:bucket/*key",
                 post(post_object)
@@ -309,6 +317,7 @@ impl S3HttpHandler {
                     .delete(delete_object)
                     .head(head_object),
             )
+            .layer(middleware::from_fn(log_raw_request))
             .with_state(self.state)
     }
 
@@ -414,16 +423,26 @@ impl S3HttpHandler {
         let payload_header = headers
             .get("x-amz-content-sha256")
             .and_then(|v| v.to_str().ok());
-        let computed_payload_hash = sha256_hex(payload);
+
+        // For PUT/POST with x-amz-content-sha256 header, trust the header value
+        // and skip body validation during authentication. Body will be validated later.
         let payload_hash = match payload_header {
             Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
             Some(v) => {
-                if v != computed_payload_hash {
-                    return Err(S3Error::InvalidCredentials);
+                // If payload is provided and non-empty, validate it
+                if !payload.is_empty() {
+                    let computed_payload_hash = sha256_hex(payload);
+                    if v != computed_payload_hash {
+                        return Err(S3Error::InvalidCredentials);
+                    }
                 }
+                // Trust the header value for signature calculation
                 v.to_string()
             }
-            None => computed_payload_hash,
+            None => {
+                // No header, compute from payload
+                sha256_hex(payload)
+            }
         };
         metrics::record_sigv4_stage("headers", headers_start.elapsed().as_secs_f64());
 
@@ -431,6 +450,10 @@ impl S3HttpHandler {
         let canonical_start = std::time::Instant::now();
         let canonical_request =
             build_canonical_request(method, uri, headers, &parsed.signed_headers, &payload_hash)?;
+        tracing::debug!(
+            "Canonical request hex: {}",
+            hex::encode(canonical_request.as_bytes())
+        );
         let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
         metrics::record_sigv4_stage("canonical", canonical_start.elapsed().as_secs_f64());
 
@@ -439,6 +462,14 @@ impl S3HttpHandler {
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}/{}/{}/aws4_request\n{}",
             amz_date, parsed.date, parsed.region, parsed.service, canonical_request_hash
+        );
+        tracing::debug!(
+            "string_to_sign:\n{}",
+            string_to_sign
+        );
+        tracing::debug!(
+            "string_to_sign hex: {}",
+            hex::encode(string_to_sign.as_bytes())
         );
         metrics::record_sigv4_stage("string_to_sign", sign_build_start.elapsed().as_secs_f64());
 
@@ -451,6 +482,10 @@ impl S3HttpHandler {
             .secret_for(&parsed.access_key)
             .await
             .map_err(|_| S3Error::InvalidCredentials)?;
+        tracing::debug!(
+            "Using secret key (first 5 chars): {}...",
+            &secret.chars().take(5).collect::<String>()
+        );
         let sig = sign_string(&secret, &parsed, &string_to_sign)?;
         let computed_signature = hex::encode(sig);
         metrics::record_sigv4_stage("sign", sign_start.elapsed().as_secs_f64());
@@ -458,6 +493,18 @@ impl S3HttpHandler {
         // Stage 6: Verify signature
         let verify_start = std::time::Instant::now();
         if computed_signature != parsed.signature {
+            tracing::debug!(
+                expected = %parsed.signature,
+                computed = %computed_signature,
+                canonical_request = %canonical_request,
+                string_to_sign = %string_to_sign,
+                access_key = %parsed.access_key,
+                region = %parsed.region,
+                service = %parsed.service,
+                date = %parsed.date,
+                signed_headers = ?parsed.signed_headers,
+                "SigV4 signature mismatch"
+            );
             metrics::record_sigv4_stage("verify", verify_start.elapsed().as_secs_f64());
             metrics::increment_auth_failure("sigv4");
             return Err(S3Error::InvalidCredentials);
@@ -878,11 +925,26 @@ fn sign_string(
     auth: &SigV4Authorization,
     string_to_sign: &str,
 ) -> Result<Vec<u8>, S3Error> {
-    let k_date = hmac_sign(format!("AWS4{}", secret).as_bytes(), auth.date.as_bytes())?;
+    let k_secret = format!("AWS4{}", secret);
+    tracing::debug!("k_secret (first 10): {}", &k_secret.chars().take(10).collect::<String>());
+    tracing::debug!("date bytes: {}", hex::encode(auth.date.as_bytes()));
+
+    let k_date = hmac_sign(k_secret.as_bytes(), auth.date.as_bytes())?;
+    tracing::debug!("k_date: {}", hex::encode(&k_date));
+
     let k_region = hmac_sign(&k_date, auth.region.as_bytes())?;
+    tracing::debug!("k_region: {}", hex::encode(&k_region));
+
     let k_service = hmac_sign(&k_region, auth.service.as_bytes())?;
+    tracing::debug!("k_service: {}", hex::encode(&k_service));
+
     let k_signing = hmac_sign(&k_service, b"aws4_request")?;
-    hmac_sign(&k_signing, string_to_sign.as_bytes())
+    tracing::debug!("k_signing: {}", hex::encode(&k_signing));
+
+    let sig = hmac_sign(&k_signing, string_to_sign.as_bytes())?;
+    tracing::debug!("final signature: {}", hex::encode(&sig));
+
+    Ok(sig)
 }
 
 fn normalize_header_value(value: &str) -> String {
@@ -899,7 +961,11 @@ fn canonical_uri(path: &str) -> String {
         if i > 0 {
             out.push('/');
         }
-        out.push_str(&utf8_percent_encode(segment, AWS_ENCODE_SET).to_string());
+        // Decode first to handle already percent-encoded characters,
+        // then re-encode to ensure proper canonical form
+        let decoded = percent_encoding::percent_decode_str(segment)
+            .decode_utf8_lossy();
+        out.push_str(&utf8_percent_encode(&decoded, AWS_ENCODE_SET).to_string());
     }
     if path.ends_with('/') && !out.ends_with('/') {
         out.push('/');
@@ -908,6 +974,74 @@ fn canonical_uri(path: &str) -> String {
         out.insert(0, '/');
     }
     out
+}
+
+/// Decode AWS chunked transfer encoding (STREAMING-AWS4-HMAC-SHA256-PAYLOAD)
+/// Format: <hex-size>;chunk-signature=<sig>\r\n<data>\r\n...0;chunk-signature=<sig>\r\n\r\n
+fn decode_aws_chunked_body(encoded: &[u8]) -> Result<Vec<u8>, S3Error> {
+    let mut decoded = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        // Find the end of the chunk header line (\r\n)
+        let header_end = encoded[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| S3Error::InvalidInput("Invalid chunk header".to_string()))?;
+
+        let header_line = std::str::from_utf8(&encoded[pos..pos + header_end])
+            .map_err(|_| S3Error::InvalidInput("Invalid chunk header encoding".to_string()))?;
+
+        // Parse chunk size from header (format: "hex-size;chunk-signature=...")
+        let chunk_size_str = header_line
+            .split(';')
+            .next()
+            .ok_or_else(|| S3Error::InvalidInput("Invalid chunk header format".to_string()))?;
+
+        let chunk_size = usize::from_str_radix(chunk_size_str, 16)
+            .map_err(|_| S3Error::InvalidInput("Invalid chunk size".to_string()))?;
+
+        tracing::debug!(
+            "Decoded chunk: size={} (0x{}), header_line={}",
+            chunk_size,
+            chunk_size_str,
+            header_line
+        );
+
+        // Move past the header line and \r\n
+        pos += header_end + 2;
+
+        if chunk_size == 0 {
+            // Final chunk, we're done
+            tracing::debug!(
+                "Reached final chunk. Total decoded size: {} bytes",
+                decoded.len()
+            );
+            break;
+        }
+
+        // Verify we have enough data for the chunk
+        if pos + chunk_size > encoded.len() {
+            return Err(S3Error::InvalidInput(format!(
+                "Chunk size {} exceeds remaining data",
+                chunk_size
+            )));
+        }
+
+        // Extract the chunk data
+        decoded.extend_from_slice(&encoded[pos..pos + chunk_size]);
+        pos += chunk_size;
+
+        // Skip the trailing \r\n after chunk data
+        if pos + 2 > encoded.len() || &encoded[pos..pos + 2] != b"\r\n" {
+            return Err(S3Error::InvalidInput(
+                "Missing \\r\\n after chunk data".to_string(),
+            ));
+        }
+        pos += 2;
+    }
+
+    Ok(decoded)
 }
 
 fn canonical_query(uri: &Uri) -> String {
@@ -1796,14 +1930,53 @@ async fn put_object(
     Query(mq): Query<MultipartQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    body: Bytes,
+    req: Request,
 ) -> Result<impl IntoResponse, S3Error> {
     let s3_handler = S3HttpHandler {
         state: state.clone(),
     };
+
+    // Authenticate first with empty body (trusts x-amz-content-sha256 header)
     s3_handler
-        .authenticate(&Method::PUT, &uri, &headers, &body)
+        .authenticate(&Method::PUT, &uri, &headers, &[])
         .await?;
+
+    // Now read the body after authentication succeeds
+    let raw_body = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|e| S3Error::InvalidInput(format!("Failed to read body: {}", e)))?;
+
+    // Check if body is AWS chunked encoded and decode if necessary
+    let body = if let Some(content_sha256) = headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) {
+        if content_sha256.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+            // Decode AWS chunked encoding
+            tracing::debug!(
+                "Decoding AWS chunked body: raw_size={} bytes",
+                raw_body.len()
+            );
+            let decoded = decode_aws_chunked_body(&raw_body)?;
+            tracing::info!(
+                "Decoded AWS chunked body: raw_size={} bytes, decoded_size={} bytes",
+                raw_body.len(),
+                decoded.len()
+            );
+            Bytes::from(decoded)
+        } else if content_sha256 != "UNSIGNED-PAYLOAD" {
+            // Validate non-streaming body hash
+            let actual_hash = sha256_hex(&raw_body);
+            if actual_hash != content_sha256 {
+                return Err(S3Error::InvalidInput(format!(
+                    "Body hash mismatch: expected {}, got {}",
+                    content_sha256, actual_hash
+                )));
+            }
+            raw_body
+        } else {
+            raw_body
+        }
+    } else {
+        raw_body
+    };
 
     // Check bucket policy
     s3_handler
@@ -2020,14 +2193,53 @@ async fn post_object(
     Query(mq): Query<MultipartQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    body: Bytes,
+    req: Request,
 ) -> Result<impl IntoResponse, S3Error> {
     let s3_handler = S3HttpHandler {
         state: state.clone(),
     };
+
+    // Authenticate first with empty body (trusts x-amz-content-sha256 header)
     s3_handler
-        .authenticate(&Method::POST, &uri, &headers, &body)
+        .authenticate(&Method::POST, &uri, &headers, &[])
         .await?;
+
+    // Now read the body after authentication succeeds
+    let raw_body = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|e| S3Error::InvalidInput(format!("Failed to read body: {}", e)))?;
+
+    // Check if body is AWS chunked encoded and decode if necessary
+    let body = if let Some(content_sha256) = headers.get("x-amz-content-sha256").and_then(|v| v.to_str().ok()) {
+        if content_sha256.starts_with("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") {
+            // Decode AWS chunked encoding
+            tracing::debug!(
+                "Decoding AWS chunked body: raw_size={} bytes",
+                raw_body.len()
+            );
+            let decoded = decode_aws_chunked_body(&raw_body)?;
+            tracing::info!(
+                "Decoded AWS chunked body: raw_size={} bytes, decoded_size={} bytes",
+                raw_body.len(),
+                decoded.len()
+            );
+            Bytes::from(decoded)
+        } else if content_sha256 != "UNSIGNED-PAYLOAD" && !raw_body.is_empty() {
+            // Validate non-streaming body hash
+            let actual_hash = sha256_hex(&raw_body);
+            if actual_hash != content_sha256 {
+                return Err(S3Error::InvalidInput(format!(
+                    "Body hash mismatch: expected {}, got {}",
+                    content_sha256, actual_hash
+                )));
+            }
+            raw_body
+        } else {
+            raw_body
+        }
+    } else {
+        raw_body
+    };
 
     if mq.uploads.is_some() {
         let upload_id = state.init_multipart(&bucket, &key).await?;
@@ -2398,6 +2610,8 @@ struct ListObjectsParams {
     lifecycle: Option<String>,  // If present, get/put/delete lifecycle config
     #[serde(default)]
     policy: Option<String>,  // If present, get/put/delete bucket policy
+    #[serde(default)]
+    location: Option<String>,  // If present, get bucket location
 }
 
 #[derive(Deserialize, Default)]
@@ -2449,10 +2663,22 @@ fn copy_headers_from_map(headers: &HeaderMap) -> CopyHeaders {
 async fn list_objects(
     State(state): State<S3State>,
     Path(bucket): Path<String>,
-    Query(params): Query<ListObjectsParams>,
     OriginalUri(uri): OriginalUri,
+    Query(params): Query<ListObjectsParams>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, S3Error> {
+    tracing::debug!("=== list_objects REQUEST ===");
+    tracing::debug!("Bucket: {}", bucket);
+    tracing::debug!("OriginalUri: {}", uri);
+    tracing::debug!("OriginalUri.path(): {}", uri.path());
+    tracing::debug!("OriginalUri.query(): {:?}", uri.query());
+    tracing::debug!("All Headers:");
+    for (name, value) in headers.iter() {
+        if let Ok(v) = value.to_str() {
+            tracing::debug!("  {}: {}", name, v);
+        }
+    }
+
     let s3_handler = S3HttpHandler {
         state: state.clone(),
     };
@@ -2525,6 +2751,22 @@ async fn list_objects(
             )
         };
 
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+        return Ok(attach_common_headers(resp, &state));
+    }
+
+    // Check if this is a GET bucket location request
+    if params.location.is_some() {
+        // Return bucket location (region)
+        let region = &state.context.region;
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">{}</LocationConstraint>"#,
+            region
+        );
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/xml")
@@ -4101,6 +4343,57 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn test_build_canonical_request_with_warp_inputs() {
+        // Test that build_canonical_request() produces the exact output needed for warp
+        // This test uses the actual request that warp sends for GET /my-bucket/?location=
+
+        use axum::http::{Method, Uri};
+        use axum::http::HeaderMap;
+
+        // Build URI with query string exactly as warp sends it
+        let uri: Uri = "/my-bucket/?location=".parse().unwrap();
+
+        // Build headers exactly as warp sends them
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:9000".parse().unwrap());
+        headers.insert("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".parse().unwrap());
+        headers.insert("x-amz-date", "20251217T044334Z".parse().unwrap());
+
+        let signed_headers = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+
+        let payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        // Call the actual function
+        let result = build_canonical_request(&Method::GET, &uri, &headers, &signed_headers, payload_hash).unwrap();
+
+        // Expected canonical request (from our passing test)
+        let expected = "GET\n/my-bucket/\nlocation=\nhost:localhost:9000\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20251217T044334Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        println!("Expected:\n{}", expected);
+        println!("\nActual:\n{}", result);
+
+        // Compare byte by byte to see any differences
+        if result != expected {
+            println!("\n=== DIFFERENCE FOUND ===");
+            println!("Expected length: {}", expected.len());
+            println!("Actual length: {}", result.len());
+
+            for (i, (e, a)) in expected.chars().zip(result.chars()).enumerate() {
+                if e != a {
+                    println!("First difference at position {}: expected {:?} got {:?}", i, e, a);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(result, expected, "Canonical request must match exactly");
+    }
+
     fn extract_between(text: &str, start: &str, end: &str) -> Option<String> {
         let s = text.find(start)? + start.len();
         let e = text[s..].find(end)? + s;
@@ -4979,4 +5272,21 @@ mod tests {
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("AccessDenied"));
     }
+}
+
+/// Middleware to log raw request URI before any processing
+async fn log_raw_request(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+
+    tracing::debug!("=== RAW REQUEST MIDDLEWARE ===");
+    tracing::debug!("Method: {}", method);
+    tracing::debug!("URI: {}", uri);
+    tracing::debug!("URI path: {}", uri.path());
+    tracing::debug!("URI query: {:?}", uri.query());
+    if let Some(q) = uri.query() {
+        tracing::debug!("URI query bytes: {}", hex::encode(q.as_bytes()));
+    }
+
+    next.run(req).await
 }

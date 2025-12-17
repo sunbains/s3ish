@@ -1,3 +1,18 @@
+// Copyright PingCAP Inc. 2025.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
 use crate::observability::metrics;
 use crate::storage::common::{compute_etag, validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
@@ -217,15 +232,21 @@ impl VersionStorage for InMemoryStorage {
                 key: key.to_string(),
             })?;
 
-        // Decode the erasure-coded shards
-        // Convert Vec<Bytes> to Vec<Option<Vec<u8>>> format expected by decode
-        let mut shard_options: Vec<Option<Vec<u8>>> = stored_obj.shards
-            .iter()
-            .map(|b| Some(b.to_vec()))
-            .collect();
-        let data = self.erasure.decode(&mut shard_options, stored_obj.orig_len)?;
+        // InMemory stores data as-is without erasure coding (single shard)
+        let data = if stored_obj.shards.len() == 1 {
+            // Direct storage - just clone the single shard
+            stored_obj.shards[0].clone()
+        } else {
+            // Legacy erasure-coded data - decode it
+            let mut shard_options: Vec<Option<Vec<u8>>> = stored_obj.shards
+                .iter()
+                .map(|b| Some(b.to_vec()))
+                .collect();
+            let decoded = self.erasure.decode(&mut shard_options, stored_obj.orig_len)?;
+            Bytes::from(decoded)
+        };
 
-        Ok(Bytes::from(data))
+        Ok(data)
     }
 }
 
@@ -289,8 +310,10 @@ impl StorageBackend for InMemoryStorage {
 
         let size = data.len() as u64;
         let etag = compute_etag(&data);
-        let (shards, orig_len) = self.erasure.encode(&data)?;
-        let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
+        // InMemory storage doesn't need erasure coding - just store data as-is
+        // Erasure coding is for disk failure protection, not needed for RAM
+        let shards = vec![data.clone()];
+        let orig_len = data.len();
 
         // Check if versioning is enabled for this bucket using VersionManager
         let manager = VersionManager::new(self);
@@ -393,9 +416,16 @@ impl StorageBackend for InMemoryStorage {
                 key: key.to_string(),
             })?;
 
-        let mut shards: Vec<Option<Vec<u8>>> =
-            obj.shards.iter().map(|c| Some(c.to_vec())).collect();
-        let data = self.erasure.decode(&mut shards, obj.orig_len)?;
+        // InMemory stores data as-is without erasure coding (single shard)
+        let data = if obj.shards.len() == 1 {
+            // Direct storage - just clone the single shard
+            obj.shards[0].to_vec()
+        } else {
+            // Legacy erasure-coded data - decode it
+            let mut shards: Vec<Option<Vec<u8>>> =
+                obj.shards.iter().map(|c| Some(c.to_vec())).collect();
+            self.erasure.decode(&mut shards, obj.orig_len)?
+        };
 
         // Record overall operation metrics
         let duration = start_time.elapsed().as_secs_f64();
@@ -526,8 +556,9 @@ impl StorageBackend for InMemoryStorage {
 
         let (data, _meta) = self.get_object(src_bucket, src_key).await?;
         let etag = compute_etag(&data);
-        let (shards, orig_len) = self.erasure.encode(&data)?;
-        let shards: Vec<Bytes> = shards.into_iter().map(Bytes::from).collect();
+        // InMemory storage doesn't need erasure coding - just store data as-is
+        let shards = vec![data.clone()];
+        let orig_len = data.len();
 
         // Check if versioning is enabled for destination bucket
         let versioning_status = {

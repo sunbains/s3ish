@@ -1,3 +1,18 @@
+// Copyright PingCAP Inc. 2025.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
 use crate::observability::metrics;
 use crate::storage::common::{validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
@@ -10,9 +25,23 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::fs::remove_dir_all;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter, BufReader};
+
+/// Configuration for FileStorage initialization
+#[derive(Debug, Clone)]
+pub struct FileStorageConfig {
+    pub drives: Vec<PathBuf>,
+    pub metadata_drive: Option<PathBuf>,
+    pub data_blocks: usize,
+    pub parity_blocks: usize,
+    pub block_size: usize,
+    pub cache_config: crate::storage::writeback_cache::CacheConfig,
+    pub write_buffer_size: usize,
+    pub read_buffer_size: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMeta {
@@ -42,10 +71,16 @@ struct StoredMeta {
 /// Simple filesystem-backed storage. Objects are stored under `drives[i]/bucket/key`.
 /// Metadata is persisted alongside each object as `<key>.meta` JSON.
 /// Supports multiple drives for spreading shards across physical disks.
-#[derive(Debug, Clone)]
 pub struct FileStorage {
     pub(crate) drives: Vec<PathBuf>,
+    /// Optional dedicated drive for metadata (if None, uses first data drive)
+    metadata_drive: Option<PathBuf>,
     erasure: Erasure,
+    writeback_cache: Arc<crate::storage::writeback_cache::WriteBackCache>,
+    /// Write buffer size in bytes
+    write_buffer_size: usize,
+    /// Read buffer size in bytes
+    read_buffer_size: usize,
 }
 
 impl FileStorage {
@@ -61,6 +96,49 @@ impl FileStorage {
         parity_blocks: usize,
         block_size: usize,
     ) -> Result<Self, StorageError> {
+        // Use default cache config, no separate metadata drive, default buffer sizes
+        let cache_config = crate::storage::writeback_cache::CacheConfig::default();
+        Self::new_multi_drive_full(drives, None, data_blocks, parity_blocks, block_size, cache_config, 1024 * 1024, 1024 * 1024).await
+    }
+
+    /// Create FileStorage with multiple drives, custom erasure coding, and cache configuration
+    pub async fn new_multi_drive_with_cache(
+        drives: Vec<PathBuf>,
+        data_blocks: usize,
+        parity_blocks: usize,
+        block_size: usize,
+        cache_config: crate::storage::writeback_cache::CacheConfig,
+    ) -> Result<Self, StorageError> {
+        // No separate metadata drive, default buffer sizes
+        Self::new_multi_drive_full(drives, None, data_blocks, parity_blocks, block_size, cache_config, 1024 * 1024, 1024 * 1024).await
+    }
+
+    /// Create FileStorage from configuration struct
+    pub async fn from_config(config: FileStorageConfig) -> Result<Self, StorageError> {
+        Self::new_multi_drive_full(
+            config.drives,
+            config.metadata_drive,
+            config.data_blocks,
+            config.parity_blocks,
+            config.block_size,
+            config.cache_config,
+            config.write_buffer_size,
+            config.read_buffer_size,
+        ).await
+    }
+
+    /// Create FileStorage with all configuration options including optional metadata drive
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_multi_drive_full(
+        drives: Vec<PathBuf>,
+        metadata_drive: Option<PathBuf>,
+        data_blocks: usize,
+        parity_blocks: usize,
+        block_size: usize,
+        cache_config: crate::storage::writeback_cache::CacheConfig,
+        write_buffer_size: usize,
+        read_buffer_size: usize,
+    ) -> Result<Self, StorageError> {
         if drives.is_empty() {
             return Err(StorageError::InvalidInput(
                 "At least one drive path required".to_string(),
@@ -74,9 +152,34 @@ impl FileStorage {
                 .map_err(|e| StorageError::Internal(format!("init drive {:?}: {}", drive, e)))?;
         }
 
+        // Create metadata drive directory if specified
+        if let Some(ref meta_drive) = metadata_drive {
+            fs::create_dir_all(meta_drive)
+                .await
+                .map_err(|e| StorageError::Internal(format!("init metadata drive {:?}: {}", meta_drive, e)))?;
+        }
+
+        // Create write-back cache
+        let writeback_cache = Arc::new(crate::storage::writeback_cache::WriteBackCache::new(cache_config.clone()));
+
+        tracing::info!(
+            drives = drives.len(),
+            metadata_drive = ?metadata_drive,
+            data_blocks = data_blocks,
+            parity_blocks = parity_blocks,
+            block_size = block_size,
+            cache_enabled = cache_config.enabled,
+            flush_interval_secs = cache_config.flush_interval_secs,
+            "FileStorage initialized with write-back cache"
+        );
+
         Ok(Self {
             drives,
+            metadata_drive,
             erasure: Erasure::new(data_blocks, parity_blocks, block_size)?,
+            writeback_cache,
+            write_buffer_size,
+            read_buffer_size,
         })
     }
 
@@ -91,9 +194,10 @@ impl FileStorage {
         &self.drives[drive_idx]
     }
 
-    /// Get primary drive (first drive) for metadata and bucket operations
+    /// Get primary drive for metadata and bucket operations
+    /// If metadata_drive is configured, returns that; otherwise returns first data drive
     fn primary_drive(&self) -> &Path {
-        &self.drives[0]
+        self.metadata_drive.as_deref().unwrap_or(&self.drives[0])
     }
 
     fn bucket_path(&self, bucket: &str) -> PathBuf {
@@ -279,7 +383,7 @@ impl FileStorage {
             let shard_path = shard_dir.join(format!("{}", idx));
 
             match fs::File::open(&shard_path).await {
-                Ok(f) => readers.push(Some(BufReader::with_capacity(65536, f))),
+                Ok(f) => readers.push(Some(BufReader::with_capacity(self.read_buffer_size, f))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => readers.push(None),
                 Err(e) => return Err(StorageError::Internal(format!("open shard {} on {:?}: {}", idx, drive, e))),
             }
@@ -296,7 +400,7 @@ impl FileStorage {
         for idx in 0..total {
             let shard_path = shard_dir.join(format!("{}", idx));
             match fs::File::open(&shard_path).await {
-                Ok(f) => readers.push(Some(BufReader::with_capacity(65536, f))),
+                Ok(f) => readers.push(Some(BufReader::with_capacity(self.read_buffer_size, f))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => readers.push(None),
                 Err(e) => return Err(StorageError::Internal(format!("open shard {}: {}", idx, e))),
             }
@@ -385,11 +489,9 @@ impl FileStorage {
             } else {
                 // Compute parity from data blocks if parity shard doesn't exist
                 let mut parity = vec![0u8; block_size];
-                for block_opt in &blocks {
-                    if let Some(b) = block_opt {
-                        for (i, byte) in b.iter().enumerate() {
-                            parity[i] ^= byte;
-                        }
+                for b in blocks.iter().flatten() {
+                    for (i, byte) in b.iter().enumerate() {
+                        parity[i] ^= byte;
                     }
                 }
                 parity
@@ -865,8 +967,8 @@ impl StorageBackend for FileStorage {
             let file = fs::File::create(&shard_path)
                 .await
                 .map_err(|e| StorageError::Internal(format!("create temp shard {} on {:?}: {}", idx, drive, e)))?;
-            // Use large 256KB buffer for high throughput streaming writes
-            files.push(BufWriter::with_capacity(262144, file));
+            // Use configured buffer size to minimize write syscalls
+            files.push(BufWriter::with_capacity(self.write_buffer_size, file));
         }
 
         // Compute BLAKE3 hash incrementally while writing shards (single pass through data)
@@ -911,13 +1013,17 @@ impl StorageBackend for FileStorage {
             }
         }
 
-        // ATOMIC WRITE PHASE 2: Flush all shards in parallel
+        // ATOMIC WRITE PHASE 2: Flush buffers in parallel
+        // Note: Not calling fsync here for performance - data will be in page cache
+        // The OS will write back to disk asynchronously
+        // For durability guarantees, call sync() periodically or after consistent points
         let mut flush_handles = Vec::new();
         for (idx, mut f) in files.into_iter().enumerate() {
             let handle = tokio::spawn(async move {
+                // Flush the BufWriter to push buffered data to the kernel page cache
                 f.flush()
                     .await
-                    .map_err(|e| StorageError::Internal(format!("flush temp shard {}: {}", idx, e)))?;
+                    .map_err(|e| StorageError::Internal(format!("flush shard {}: {}", idx, e)))?;
                 drop(f); // Close file handle
                 Ok::<(), StorageError>(())
             });
@@ -1044,6 +1150,7 @@ impl StorageBackend for FileStorage {
         // Write metadata concurrently with the last shard operations for better performance
         let meta_bytes =
             serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
+        let meta_bytes_len = meta_bytes.len();
         let meta_write = tokio::spawn({
             let meta_path = meta_path.clone();
             async move {
@@ -1057,6 +1164,24 @@ impl StorageBackend for FileStorage {
         meta_write
             .await
             .map_err(|e| StorageError::Internal(format!("metadata write task failed: {}", e)))??;
+
+        // Mark all shard files and metadata as dirty for write-back cache
+        // This enables batched fsync for better performance
+        if self.writeback_cache.is_enabled() {
+            // Mark all shard files as dirty
+            for idx in 0..shard_count {
+                let drive = self.drive_for_shard(idx);
+                let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+                let final_shard = shard_dir.join(format!("{}", idx));
+
+                // Estimate shard size (data_len / data_blocks, with some overhead for parity)
+                let approx_shard_size = (size as usize) / self.erasure.data_blocks + self.erasure.block_size;
+                self.writeback_cache.mark_dirty(final_shard, approx_shard_size).await;
+            }
+
+            // Mark metadata file as dirty
+            self.writeback_cache.mark_dirty(meta_path.clone(), meta_bytes_len).await;
+        }
 
         // Record overall operation metrics
         let duration = start_time.elapsed().as_secs_f64();

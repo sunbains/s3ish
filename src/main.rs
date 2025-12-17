@@ -1,3 +1,18 @@
+// Copyright PingCAP Inc. 2025.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
 use clap::Parser;
 use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
@@ -21,7 +36,7 @@ struct Args {
     listen: Option<String>,
 
     /// Protocol to use (grpc or http)
-    #[arg(short, long, default_value = "grpc")]
+    #[arg(short, long, default_value = "http")]
     protocol: String,
 
     /// Path to configuration file
@@ -56,19 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(|s| s.into())
                 .collect();
-            let fs = FileStorage::new_multi_drive(
+
+            // Convert config::CacheConfig to writeback_cache::CacheConfig
+            let cache_config = s3ish::storage::writeback_cache::CacheConfig {
+                enabled: cfg.storage.cache.enabled,
+                flush_interval_secs: cfg.storage.cache.flush_interval_secs,
+                flush_threshold_bytes: cfg.storage.cache.flush_threshold_bytes,
+            };
+
+            // Convert optional metadata_drive path
+            let metadata_drive = cfg.storage.metadata_drive.as_ref().map(|s| s.into());
+
+            let fs = FileStorage::new_multi_drive_full(
                 drives,
+                metadata_drive,
                 cfg.storage.erasure.data_blocks,
                 cfg.storage.erasure.parity_blocks,
                 cfg.storage.erasure.block_size,
+                cache_config,
+                cfg.storage.io.write_buffer_size,
+                cfg.storage.io.read_buffer_size,
             ).await?;
-            tracing::info!(
-                num_drives = fs.num_drives(),
-                data_blocks = cfg.storage.erasure.data_blocks,
-                parity_blocks = cfg.storage.erasure.parity_blocks,
-                block_size = cfg.storage.erasure.block_size,
-                "FileStorage initialized"
-            );
             Arc::new(fs)
         }
         _ => Arc::new(InMemoryStorage::new()),

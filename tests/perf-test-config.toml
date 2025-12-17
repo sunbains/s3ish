@@ -3,9 +3,21 @@ listen_addr = "127.0.0.1:9999"
 auth_file = "./creds.txt"
 region = "us-east-1"
 
+[test]
+# Test duration in seconds (how long each benchmark runs)
+duration_secs = 10
+# Object size for comparison tests (in bytes)
+object_size = 1048576000  # 1 MB
+
 [storage]
 backend = "file"
-path = "./perf-test-data"
+# path = "/local/ssd1/s3ish-data"
+# Option 2: Multiple drives (recommended for performance)
+# When drives is specified, shards are distributed across drives using modulo sharding
+# This significantly improves performance by avoiding disk seek thrashing
+# Example: With 4 drives, shard 0 goes to drive 0, shard 1 to drive 1, etc.
+drives = ["/local/ssd1/s3ish-data", "/local/ssd2/s3ish-data"]
+# metadata_drive = "/local/ssd/s3ish-metadata"  # Optional: separate drive for metadata
 
 [storage.erasure]
 # Number of data blocks (shards) per object
@@ -14,6 +26,15 @@ data_blocks = 4
 parity_blocks = 1
 # Block size in bytes (1 MB = 1048576 bytes)
 block_size = 1048576
+
+[storage.cache]
+enabled = true
+flush_interval_secs = 5
+flush_threshold_bytes = 104857600  # 100 MB
+
+[storage.io]
+write_buffer_size = 1048576  # 1 MB
+read_buffer_size = 1048576   # 1 MB
 
 [lifecycle]
 enabled = false

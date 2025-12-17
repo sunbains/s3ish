@@ -1,3 +1,18 @@
+// Copyright PingCAP Inc. 2025.
+//
+// This program is free software; you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, write to the Free Software Foundation, Inc.,
+// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -21,6 +36,9 @@ pub struct Config {
 
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+
+    #[serde(default)]
+    pub test: TestConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,9 +52,19 @@ pub struct StorageConfig {
     /// multiple drive paths for file backend (spreads shards across drives)
     #[serde(default)]
     pub drives: Vec<String>,
+    /// optional dedicated drive for metadata files (.meta, .versioning, .lifecycle)
+    /// if not specified, metadata goes to first data drive
+    #[serde(default)]
+    pub metadata_drive: Option<String>,
     /// erasure coding configuration
     #[serde(default)]
     pub erasure: ErasureConfig,
+    /// write-back cache configuration
+    #[serde(default)]
+    pub cache: CacheConfig,
+    /// I/O buffer configuration
+    #[serde(default)]
+    pub io: IoConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,13 +90,58 @@ impl Default for ErasureConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheConfig {
+    /// Enable write-back cache for batched fsync
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    /// Flush interval in seconds (0 = only on threshold)
+    #[serde(default = "default_cache_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    /// Flush after this many bytes written (0 = only on timer)
+    #[serde(default = "default_cache_flush_threshold_bytes")]
+    pub flush_threshold_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IoConfig {
+    /// Buffer size for writes in bytes (larger = fewer syscalls, more memory)
+    #[serde(default = "default_write_buffer_size")]
+    pub write_buffer_size: usize,
+    /// Buffer size for reads in bytes (larger = fewer syscalls, more memory)
+    #[serde(default = "default_read_buffer_size")]
+    pub read_buffer_size: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            flush_interval_secs: default_cache_flush_interval_secs(),
+            flush_threshold_bytes: default_cache_flush_threshold_bytes(),
+        }
+    }
+}
+
+impl Default for IoConfig {
+    fn default() -> Self {
+        Self {
+            write_buffer_size: default_write_buffer_size(),
+            read_buffer_size: default_read_buffer_size(),
+        }
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: default_backend(),
             path: default_path(),
             drives: Vec::new(),
+            metadata_drive: None,
             erasure: ErasureConfig::default(),
+            cache: CacheConfig::default(),
+            io: IoConfig::default(),
         }
     }
 }
@@ -154,5 +227,52 @@ fn default_parity_blocks() -> usize {
 }
 
 fn default_block_size() -> usize {
+    1024 * 1024 // 1 MB
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_flush_interval_secs() -> u64 {
+    5 // 5 seconds
+}
+
+fn default_cache_flush_threshold_bytes() -> usize {
+    100 * 1024 * 1024 // 100 MB
+}
+
+fn default_write_buffer_size() -> usize {
+    1024 * 1024 // 1 MB - matches block_size for optimal batching
+}
+
+fn default_read_buffer_size() -> usize {
+    1024 * 1024 // 1 MB - matches block_size for optimal sequential reads
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TestConfig {
+    /// Test duration in seconds
+    #[serde(default = "default_test_duration_secs")]
+    pub duration_secs: u64,
+    /// Object size for tests in bytes
+    #[serde(default = "default_test_object_size")]
+    pub object_size: usize,
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        Self {
+            duration_secs: default_test_duration_secs(),
+            object_size: default_test_object_size(),
+        }
+    }
+}
+
+fn default_test_duration_secs() -> u64 {
+    10 // 10 seconds
+}
+
+fn default_test_object_size() -> usize {
     1024 * 1024 // 1 MB
 }

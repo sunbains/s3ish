@@ -307,7 +307,7 @@ impl S3HttpHandler {
                     .post(delete_objects)
                     .head(head_bucket),
             )
-            .route("/:bucket/", get(list_objects).head(head_bucket))
+            .route("/:bucket/", get(list_objects).head(head_bucket).post(post_bucket))
             .route(
                 "/:bucket/*key",
                 post(post_object)
@@ -2612,6 +2612,8 @@ struct ListObjectsParams {
     policy: Option<String>,  // If present, get/put/delete bucket policy
     #[serde(default)]
     location: Option<String>,  // If present, get bucket location
+    #[serde(default)]
+    delete: Option<String>,  // If present, batch delete objects (POST only)
 }
 
 #[derive(Deserialize, Default)]
@@ -2657,6 +2659,101 @@ fn copy_headers_from_map(headers: &HeaderMap) -> CopyHeaders {
         copy_source_if_none_match: get("x-amz-copy-source-if-none-match"),
         metadata_directive: get("x-amz-metadata-directive"),
     }
+}
+
+/// POST /{bucket}/?delete= - Delete multiple objects (batch delete)
+async fn post_bucket(
+    State(state): State<S3State>,
+    Path(bucket): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<ListObjectsParams>,
+    headers: HeaderMap,
+    req: Request,
+) -> Result<Response, S3Error> {
+    let s3_handler = S3HttpHandler {
+        state: state.clone(),
+    };
+
+    // Authenticate first with empty body
+    s3_handler
+        .authenticate(&Method::POST, &uri, &headers, &[])
+        .await?;
+
+    // Check if this is a DeleteObjects request
+    if params.delete.is_some() {
+        // Read the request body
+        let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+            .await
+            .map_err(|e| S3Error::InvalidInput(format!("Failed to read body: {}", e)))?;
+
+        let body_str = std::str::from_utf8(&body)
+            .map_err(|_| S3Error::InvalidInput("Invalid UTF-8 in request body".to_string()))?;
+
+        tracing::debug!("DeleteObjects XML: {}", body_str);
+
+        // Parse the XML to extract keys to delete
+        // Format: <Delete><Object><Key>key1</Key></Object><Object><Key>key2</Key></Object></Delete>
+        let mut keys_to_delete = Vec::new();
+        for key_match in body_str.split("<Key>").skip(1) {
+            if let Some(end_pos) = key_match.find("</Key>") {
+                let key = &key_match[..end_pos];
+                keys_to_delete.push(key.to_string());
+            }
+        }
+
+        tracing::info!(
+            "DeleteObjects request: bucket={}, count={}",
+            bucket,
+            keys_to_delete.len()
+        );
+
+        // Delete each object
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+
+        for key in keys_to_delete {
+            match state.handler.storage.delete_object(&bucket, &key).await {
+                Ok(_) => {
+                    deleted.push(key);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to delete {}: {}", key, e);
+                    errors.push((key, format!("{}", e)));
+                }
+            }
+        }
+
+        // Build XML response
+        let mut xml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+        );
+
+        for key in deleted {
+            xml.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", key));
+        }
+
+        for (key, error) in errors {
+            xml.push_str(&format!(
+                "<Error><Key>{}</Key><Code>InternalError</Code><Message>{}</Message></Error>",
+                key, error
+            ));
+        }
+
+        xml.push_str("</DeleteResult>");
+
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap();
+
+        return Ok(attach_common_headers(resp, &state));
+    }
+
+    // If not a delete request, return error
+    Err(S3Error::InvalidInput(
+        "Unsupported POST operation on bucket".to_string(),
+    ))
 }
 
 /// GET /{bucket}/ - List objects

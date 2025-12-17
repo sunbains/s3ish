@@ -1962,7 +1962,7 @@ async fn put_object(
                 raw_body.len()
             );
             let decoded = decode_aws_chunked_body(&raw_body)?;
-            tracing::info!(
+            tracing::debug!(
                 "Decoded AWS chunked body: raw_size={} bytes, decoded_size={} bytes",
                 raw_body.len(),
                 decoded.len()
@@ -2225,7 +2225,7 @@ async fn post_object(
                 raw_body.len()
             );
             let decoded = decode_aws_chunked_body(&raw_body)?;
-            tracing::info!(
+            tracing::debug!(
                 "Decoded AWS chunked body: raw_size={} bytes, decoded_size={} bytes",
                 raw_body.len(),
                 decoded.len()

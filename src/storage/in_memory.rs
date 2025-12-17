@@ -22,33 +22,120 @@ use crate::storage::{ObjectMetadata, StorageBackend, StorageError, VersioningSta
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crossbeam_queue::ArrayQueue;
+use once_cell::sync::Lazy;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks for simulated erasure coding
 
+// Number of shards for lock-free parallelism
+// Using 256 shards allows up to 256 concurrent write operations
+const NUM_SHARDS: usize = 256;
+
+// Global object pool for zero-copy ObjectMetadata reuse
+// Bounded queue prevents unbounded memory growth
+const POOL_SIZE: usize = 10000;
+static METADATA_POOL: Lazy<ArrayQueue<ObjectMetadata>> = Lazy::new(|| {
+    let pool = ArrayQueue::new(POOL_SIZE);
+
+    // Pre-populate pool with instances that have pre-allocated capacity
+    for _ in 0..POOL_SIZE {
+        let _ = pool.push(ObjectMetadata {
+            content_type: String::with_capacity(128),
+            etag: String::with_capacity(64),
+            size: 0,
+            last_modified_unix_secs: 0,
+            metadata: HashMap::with_capacity(8),
+            storage_class: None,
+            server_side_encryption: None,
+            version_id: None,
+            is_latest: true,
+            is_delete_marker: false,
+        });
+    }
+
+    pool
+});
+
+/// Get ObjectMetadata from global pool (zero-copy) or allocate new
+#[inline]
+fn get_pooled_metadata(
+    content_type: String,
+    etag: String,
+    size: u64,
+    last_modified_unix_secs: i64,
+    metadata: HashMap<String, String>,
+    storage_class: Option<String>,
+    server_side_encryption: Option<String>,
+    version_id: Option<String>,
+    is_latest: bool,
+    is_delete_marker: bool,
+) -> ObjectMetadata {
+    match METADATA_POOL.pop() {
+        Some(mut meta) => {
+            // Reuse with pre-allocated strings (zero-copy reuse)
+            meta.content_type.clear();
+            meta.content_type.push_str(&content_type);
+            meta.etag.clear();
+            meta.etag.push_str(&etag);
+            meta.size = size;
+            meta.last_modified_unix_secs = last_modified_unix_secs;
+            meta.metadata.clear();
+            meta.metadata.extend(metadata);
+            meta.storage_class = storage_class;
+            meta.server_side_encryption = server_side_encryption;
+            meta.version_id = version_id;
+            meta.is_latest = is_latest;
+            meta.is_delete_marker = is_delete_marker;
+            meta
+        }
+        None => {
+            // Pool exhausted, allocate new with capacity
+            ObjectMetadata {
+                content_type,
+                etag,
+                size,
+                last_modified_unix_secs,
+                metadata,
+                storage_class,
+                server_side_encryption,
+                version_id,
+                is_latest,
+                is_delete_marker,
+            }
+        }
+    }
+}
+
+/// Return ObjectMetadata to global pool for reuse (best effort)
+#[inline]
+fn return_pooled_metadata(meta: ObjectMetadata) {
+    let _ = METADATA_POOL.push(meta);
+}
+
 #[derive(Debug, Clone)]
 struct StoredObject {
     shards: Vec<Bytes>,
     orig_len: usize,
-    meta: ObjectMetadata,
+    meta: Arc<ObjectMetadata>,
 }
 
-/// In-memory storage implementation with simulated erasure coding and versioning support.
+/// In-memory storage implementation with sharded locks for high concurrency.
 ///
 /// Data structures:
 /// - `buckets`: a set of bucket names
-/// - `objects`: a BTreeMap keyed by (bucket, key) => Vec<StoredObject> (multiple versions)
+/// - `objects`: 256 sharded HashMaps for parallel access
 /// - `bucket_versioning`: versioning status per bucket
 ///
-/// BTreeMap gives deterministic iteration order (useful for tests and predictable listing).
-type ObjectStore = Arc<RwLock<BTreeMap<(String, String), Vec<StoredObject>>>>;
+/// Sharding allows multiple concurrent writes to different shards without contention.
+type ObjectShard = Arc<RwLock<HashMap<(String, String), Vec<StoredObject>>>>;
 
 #[derive(Debug, Clone)]
 pub struct InMemoryStorage {
     buckets: Arc<RwLock<BTreeSet<String>>>,
-    objects: ObjectStore,
+    objects: Arc<[ObjectShard; NUM_SHARDS]>,
     bucket_versioning: Arc<RwLock<HashMap<String, VersioningStatus>>>,
     multipart_uploads: Arc<RwLock<HashMap<String, InMemoryUpload>>>,
     lifecycle_policies: Arc<RwLock<HashMap<String, crate::storage::lifecycle::LifecyclePolicy>>>,
@@ -57,10 +144,33 @@ pub struct InMemoryStorage {
 }
 
 impl InMemoryStorage {
+    /// Calculate which shard a given bucket/key belongs to
+    fn shard_index(bucket: &str, key: &str) -> usize {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        bucket.hash(&mut hasher);
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % NUM_SHARDS
+    }
+
+    /// Get the appropriate shard for a bucket/key pair
+    fn get_shard(&self, bucket: &str, key: &str) -> &ObjectShard {
+        &self.objects[Self::shard_index(bucket, key)]
+    }
+}
+
+impl InMemoryStorage {
     pub fn new() -> Self {
+        // Initialize 256 shards for parallel access
+        let shards: [ObjectShard; NUM_SHARDS] = std::array::from_fn(|_| {
+            Arc::new(RwLock::new(HashMap::new()))
+        });
+
         Self {
             buckets: Arc::new(RwLock::new(BTreeSet::new())),
-            objects: Arc::new(RwLock::new(BTreeMap::new())),
+            objects: Arc::new(shards),
             bucket_versioning: Arc::new(RwLock::new(HashMap::new())),
             multipart_uploads: Arc::new(RwLock::new(HashMap::new())),
             lifecycle_policies: Arc::new(RwLock::new(HashMap::new())),
@@ -104,7 +214,8 @@ impl VersionStorage for InMemoryStorage {
         version_id: &str,
         metadata: VersionMetadata,
     ) -> Result<(), StorageError> {
-        let mut objs = self.objects.write().await;
+        let shard = self.get_shard(bucket, key);
+        let mut objs = shard.write().await;
         let obj_key = (bucket.to_string(), key.to_string());
 
         // Create a StoredObject from the version metadata
@@ -112,7 +223,7 @@ impl VersionStorage for InMemoryStorage {
         let stored_obj = StoredObject {
             shards: vec![], // Data shards are stored separately via put_object
             orig_len: metadata.size as usize,
-            meta: metadata.to_object_metadata(metadata.created_at),
+            meta: Arc::new(metadata.to_object_metadata(metadata.created_at)),
         };
 
         if let Some(versions) = objs.get_mut(&obj_key) {
@@ -137,7 +248,8 @@ impl VersionStorage for InMemoryStorage {
         key: &str,
         version_id: &str,
     ) -> Result<VersionMetadata, StorageError> {
-        let objs = self.objects.read().await;
+        let shard = self.get_shard(bucket, key);
+        let objs = shard.read().await;
         let obj_key = (bucket.to_string(), key.to_string());
 
         let versions = objs.get(&obj_key).ok_or_else(|| StorageError::ObjectNotFound {
@@ -164,7 +276,8 @@ impl VersionStorage for InMemoryStorage {
         bucket: &str,
         key: &str,
     ) -> Result<Vec<String>, StorageError> {
-        let objs = self.objects.read().await;
+        let shard = self.get_shard(bucket, key);
+        let objs = shard.read().await;
         let obj_key = (bucket.to_string(), key.to_string());
 
         if let Some(versions) = objs.get(&obj_key) {
@@ -188,7 +301,8 @@ impl VersionStorage for InMemoryStorage {
         key: &str,
         version_id: &str,
     ) -> Result<bool, StorageError> {
-        let mut objs = self.objects.write().await;
+        let shard = self.get_shard(bucket, key);
+        let mut objs = shard.write().await;
         let obj_key = (bucket.to_string(), key.to_string());
 
         if let Some(versions) = objs.get_mut(&obj_key) {
@@ -216,7 +330,8 @@ impl VersionStorage for InMemoryStorage {
         key: &str,
         version_id: &str,
     ) -> Result<Bytes, StorageError> {
-        let objs = self.objects.read().await;
+        let shard = self.get_shard(bucket, key);
+        let objs = shard.read().await;
         let obj_key = (bucket.to_string(), key.to_string());
 
         let versions = objs.get(&obj_key).ok_or_else(|| StorageError::ObjectNotFound {
@@ -265,9 +380,9 @@ impl StorageBackend for InMemoryStorage {
 
     async fn delete_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
-        // check emptiness
-        {
-            let objs = self.objects.read().await;
+        // check emptiness across all shards
+        for shard in self.objects.iter() {
+            let objs = shard.read().await;
             if objs.keys().any(|(b, _k)| b == bucket) {
                 return Err(StorageError::BucketNotEmpty(bucket.to_string()));
             }
@@ -312,12 +427,11 @@ impl StorageBackend for InMemoryStorage {
         let etag = compute_etag(&data);
         // InMemory storage doesn't need erasure coding - just store data as-is
         // Erasure coding is for disk failure protection, not needed for RAM
-        let shards = vec![data.clone()];
-        let orig_len = data.len();
+        let shards = vec![data];  // No clone - transfer ownership
+        let orig_len = size as usize;
 
-        // Check if versioning is enabled for this bucket using VersionManager
-        let manager = VersionManager::new(self);
-        let versioning_status = manager.get_bucket_versioning(bucket).await?;
+        // Check if versioning is enabled for this bucket
+        let versioning_status = self.read_versioning_status(bucket).await?;
 
         let version_id = if versioning_status == VersioningStatus::Enabled {
             Some(VersionManager::<InMemoryStorage>::generate_version_id())
@@ -325,40 +439,44 @@ impl StorageBackend for InMemoryStorage {
             None
         };
 
-        let meta = ObjectMetadata {
-            content_type: content_type.to_string(),
+        let meta = get_pooled_metadata(
+            content_type.to_string(),
             etag,
             size,
-            last_modified_unix_secs: Utc::now().timestamp(),
+            Utc::now().timestamp(),
             metadata,
             storage_class,
             server_side_encryption,
             version_id,
-            is_latest: true,
-            is_delete_marker: false,
-        };
+            true,
+            false,
+        );
 
-        // measure lock wait for write
-        let lock_start = std::time::Instant::now();
-        let mut objs = self.objects.write().await;
-        metrics::record_lock_wait("object_write", lock_start.elapsed().as_secs_f64());
-
+        let meta_for_return = meta.clone();
         let stored_obj = StoredObject {
             shards,
             orig_len,
-            meta: meta.clone(),
+            meta: Arc::new(meta),
         };
 
+        // Allocate key before acquiring lock to minimize lock hold time
         let obj_key = (bucket.to_string(), key.to_string());
 
-        if versioning_status == VersioningStatus::Enabled {
-            // Mark all previous versions as not latest using VersionManager
-            drop(objs); // Release write lock temporarily
-            manager.mark_previous_versions_not_latest(bucket, key).await?;
+        // Get the appropriate shard for this object
+        let shard = self.get_shard(bucket, key);
 
-            // Re-acquire write lock to insert new version
-            let mut objs = self.objects.write().await;
+        // measure lock wait for write
+        let lock_start = std::time::Instant::now();
+        let mut objs = shard.write().await;
+        metrics::record_lock_wait("object_write", lock_start.elapsed().as_secs_f64());
+
+        if versioning_status == VersioningStatus::Enabled {
+            // Mark all previous versions as not latest - do this inline while holding write lock
+            // This avoids dropping and re-acquiring the lock, reducing contention
             if let Some(versions) = objs.get_mut(&obj_key) {
+                for v in versions.iter_mut() {
+                    Arc::make_mut(&mut v.meta).is_latest = false;
+                }
                 versions.push(stored_obj);
             } else {
                 objs.insert(obj_key, vec![stored_obj]);
@@ -380,7 +498,7 @@ impl StorageBackend for InMemoryStorage {
             "Put object completed"
         );
 
-        Ok(meta)
+        Ok(meta_for_return)
     }
 
     #[tracing::instrument(skip(self), fields(bucket = %bucket, key = %key))]
@@ -394,9 +512,12 @@ impl StorageBackend for InMemoryStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
+        // Get the appropriate shard for this object
+        let shard = self.get_shard(bucket, key);
+
         // Measure lock wait for read
         let lock_start = std::time::Instant::now();
-        let objs = self.objects.read().await;
+        let objs = shard.read().await;
         metrics::record_lock_wait("object_read", lock_start.elapsed().as_secs_f64());
 
         let versions = objs
@@ -418,13 +539,13 @@ impl StorageBackend for InMemoryStorage {
 
         // InMemory stores data as-is without erasure coding (single shard)
         let data = if obj.shards.len() == 1 {
-            // Direct storage - just clone the single shard
-            obj.shards[0].to_vec()
+            // Direct storage - just clone the Bytes (uses reference counting)
+            obj.shards[0].clone()
         } else {
             // Legacy erasure-coded data - decode it
             let mut shards: Vec<Option<Vec<u8>>> =
                 obj.shards.iter().map(|c| Some(c.to_vec())).collect();
-            self.erasure.decode(&mut shards, obj.orig_len)?
+            Bytes::from(self.erasure.decode(&mut shards, obj.orig_len)?)
         };
 
         // Record overall operation metrics
@@ -439,7 +560,7 @@ impl StorageBackend for InMemoryStorage {
             "Get object completed"
         );
 
-        Ok((Bytes::from(data), obj.meta.clone()))
+        Ok((data, (*obj.meta).clone()))
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, StorageError> {
@@ -451,7 +572,10 @@ impl StorageBackend for InMemoryStorage {
                 return Err(StorageError::BucketNotFound(bucket.to_string()));
             }
         }
-        let objs = self.objects.read().await;
+
+        // Get the appropriate shard for this object
+        let shard = self.get_shard(bucket, key);
+        let objs = shard.read().await;
         let versions = objs
             .get(&(bucket.to_string(), key.to_string()))
             .ok_or_else(|| StorageError::ObjectNotFound {
@@ -469,25 +593,29 @@ impl StorageBackend for InMemoryStorage {
                 key: key.to_string(),
             })?;
 
-        Ok(obj.meta.clone())
+        Ok((*obj.meta).clone())
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        // Check versioning status using VersionManager
-        let manager = VersionManager::new(self);
-        let versioning_status = manager.get_bucket_versioning(bucket).await?;
+        // Check versioning status
+        let versioning_status = self.read_versioning_status(bucket).await?;
 
         if versioning_status == VersioningStatus::Enabled {
             // Use VersionManager to create a delete marker
+            let manager = VersionManager::new(self);
             manager.create_delete_marker(bucket, key).await?;
             Ok(true)
         } else {
             // Permanently delete (unversioned behavior)
-            let mut objs = self.objects.write().await;
+            // Allocate key before acquiring lock
             let obj_key = (bucket.to_string(), key.to_string());
+
+            // Get the appropriate shard for this object
+            let shard = self.get_shard(bucket, key);
+            let mut objs = shard.write().await;
             Ok(objs.remove(&obj_key).is_some())
         }
     }
@@ -508,32 +636,41 @@ impl StorageBackend for InMemoryStorage {
 
         let limit = if limit == 0 { 1000 } else { limit.min(10_000) };
 
-        let objs = self.objects.read().await;
         let mut out = Vec::new();
 
-        // Because keys are (bucket, key) sorted lexicographically, we can range-scan.
-        let start = (bucket.to_string(), prefix.to_string());
-        for ((b, k), versions) in objs.range(start..) {
-            if b != bucket {
-                break;
-            }
-            if !k.starts_with(prefix) {
-                break;
-            }
+        // With sharded HashMap, we need to iterate all shards and collect matching objects
+        for shard in self.objects.iter() {
+            let objs = shard.read().await;
 
-            // Only include the latest non-delete-marker version
-            if let Some(latest) = versions
-                .iter()
-                .rev()
-                .find(|v| v.meta.is_latest && !v.meta.is_delete_marker)
-            {
-                out.push((k.clone(), latest.meta.clone()));
+            for ((b, k), versions) in objs.iter() {
+                if b != bucket {
+                    continue;
+                }
+                if !k.starts_with(prefix) {
+                    continue;
+                }
+
+                // Only include the latest non-delete-marker version
+                if let Some(latest) = versions
+                    .iter()
+                    .rev()
+                    .find(|v| v.meta.is_latest && !v.meta.is_delete_marker)
+                {
+                    out.push((k.clone(), (*latest.meta).clone()));
+                }
+
+                if out.len() >= limit {
+                    break;
+                }
             }
 
             if out.len() >= limit {
                 break;
             }
         }
+
+        // Sort results by key for consistent ordering
+        out.sort_by(|a, b| a.0.cmp(&b.0));
 
         Ok(out)
     }
@@ -572,33 +709,37 @@ impl StorageBackend for InMemoryStorage {
             None
         };
 
-        let meta = ObjectMetadata {
-            content_type: content_type.to_string(),
+        let meta = get_pooled_metadata(
+            content_type.to_string(),
             etag,
-            size: data.len() as u64,
-            last_modified_unix_secs: Utc::now().timestamp(),
+            data.len() as u64,
+            Utc::now().timestamp(),
             metadata,
             storage_class,
             server_side_encryption,
             version_id,
-            is_latest: true,
-            is_delete_marker: false,
-        };
+            true,
+            false,
+        );
 
-        let mut objs = self.objects.write().await;
+        let meta_for_return = meta.clone();
         let stored_obj = StoredObject {
             shards,
             orig_len,
-            meta: meta.clone(),
+            meta: Arc::new(meta),
         };
 
         let obj_key = (dest_bucket.to_string(), dest_key.to_string());
+
+        // Get the destination shard
+        let dest_shard = self.get_shard(dest_bucket, dest_key);
+        let mut objs = dest_shard.write().await;
 
         if versioning_status == VersioningStatus::Enabled {
             // Mark all previous versions as not latest
             if let Some(versions) = objs.get_mut(&obj_key) {
                 for v in versions.iter_mut() {
-                    v.meta.is_latest = false;
+                    Arc::make_mut(&mut v.meta).is_latest = false;
                 }
                 versions.push(stored_obj);
             } else {
@@ -609,7 +750,7 @@ impl StorageBackend for InMemoryStorage {
             objs.insert(obj_key, vec![stored_obj]);
         }
 
-        Ok(meta)
+        Ok(meta_for_return)
     }
 
     async fn initiate_multipart(
@@ -822,24 +963,26 @@ impl StorageBackend for InMemoryStorage {
 
         let limit = if limit == 0 { 1000 } else { limit.min(10_000) };
 
-        let objs = self.objects.read().await;
         let mut out = Vec::new();
 
-        // Range-scan for keys matching the bucket and prefix
-        let start = (bucket.to_string(), prefix.to_string());
-        for ((b, k), versions) in objs.range(start..) {
-            if b != bucket {
-                break;
-            }
-            if !k.starts_with(prefix) {
-                break;
-            }
+        // Iterate all shards to find matching objects
+        for shard in self.objects.iter() {
+            let objs = shard.read().await;
 
-            // Include ALL versions (including delete markers) in reverse chronological order
-            for version in versions.iter().rev() {
-                out.push(version.meta.clone());
-                if out.len() >= limit {
-                    return Ok(out);
+            for ((b, k), versions) in objs.iter() {
+                if b != bucket {
+                    continue;
+                }
+                if !k.starts_with(prefix) {
+                    continue;
+                }
+
+                // Include ALL versions (including delete markers) in reverse chronological order
+                for version in versions.iter().rev() {
+                    out.push((*version.meta).clone());
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
                 }
             }
         }

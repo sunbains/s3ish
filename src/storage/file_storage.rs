@@ -975,32 +975,63 @@ impl StorageBackend for FileStorage {
         // BLAKE3 is 10-15x faster than MD5 and hardware-accelerated (SIMD, AVX-512)
         let mut hasher = blake3::Hasher::new();
 
-        for stripe_start in
-            (0..data.len()).step_by(self.erasure.block_size * self.erasure.data_blocks)
-        {
+        // Calculate chunk size per shard for this stripe
+        let stripe_size = self.erasure.block_size * self.erasure.data_blocks;
+
+        for stripe_start in (0..data.len()).step_by(stripe_size) {
             // build parity block
             let mut parity_block = vec![0u8; self.erasure.block_size];
+
+            // Calculate how much data is in this stripe
+            let stripe_end = std::cmp::min(stripe_start + stripe_size, data.len());
+            let stripe_data_len = stripe_end - stripe_start;
+
+            // Distribute stripe data evenly across shards
+            let chunk_size = stripe_data_len.div_ceil(self.erasure.data_blocks);
+
             for data_idx in 0..self.erasure.data_blocks {
                 let shard_idx = data_idx;
-                let offset = stripe_start + data_idx * self.erasure.block_size;
+                let offset = stripe_start + data_idx * chunk_size;
                 if offset >= data.len() {
                     break;
                 }
-                let end = std::cmp::min(offset + self.erasure.block_size, data.len());
+                let end = std::cmp::min(offset + chunk_size, data.len());
                 let slice = &data[offset..end];
 
                 // Update BLAKE3 hash incrementally (hardware-accelerated)
                 hasher.update(slice);
 
+                // Pad to 4KB page boundary for optimal I/O
+                const PAGE_SIZE: usize = 4096;
+                let padded_len = slice.len().div_ceil(PAGE_SIZE) * PAGE_SIZE;
+
+                // Write data
                 files[shard_idx]
                     .write_all(slice)
                     .await
-                    .map_err(|e| StorageError::Internal(format!("write shard: {e}")))?;
+                    .map_err(|e| StorageError::Internal(format!("write shard {}: {e}", shard_idx)))?;
+
+                // Pad with zeros to page boundary
+                if slice.len() < padded_len {
+                    let padding_size = padded_len - slice.len();
+                    tracing::debug!("Padding shard {} from {} to {} bytes (+{} padding)",
+                        shard_idx, slice.len(), padded_len, padding_size);
+                    let padding = vec![0u8; padding_size];
+                    files[shard_idx]
+                        .write_all(&padding)
+                        .await
+                        .map_err(|e| StorageError::Internal(format!("write shard {} padding: {e}", shard_idx)))?;
+                }
+
                 for (i, b) in slice.iter().enumerate() {
                     parity_block[i] ^= b;
                 }
             }
             // parity shards (identical XOR parity for each parity slot)
+            // Pad parity to 4KB page boundary for optimal I/O
+            const PAGE_SIZE: usize = 4096;
+            let parity_padded_len = parity_block.len().div_ceil(PAGE_SIZE) * PAGE_SIZE;
+
             for parity_file in files
                 .iter_mut()
                 .skip(self.erasure.data_blocks)
@@ -1010,6 +1041,15 @@ impl StorageBackend for FileStorage {
                     .write_all(&parity_block)
                     .await
                     .map_err(|e| StorageError::Internal(format!("write parity: {e}")))?;
+
+                // Pad if necessary
+                if parity_block.len() < parity_padded_len {
+                    let padding = vec![0u8; parity_padded_len - parity_block.len()];
+                    parity_file
+                        .write_all(&padding)
+                        .await
+                        .map_err(|e| StorageError::Internal(format!("write parity padding: {e}")))?;
+                }
             }
         }
 

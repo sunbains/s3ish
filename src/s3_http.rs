@@ -3029,6 +3029,23 @@ async fn ready_endpoint(State(state): State<S3State>) -> impl IntoResponse {
     (status_code, axum::Json(health_status))
 }
 
+/// Middleware to log raw request URI before any processing
+async fn log_raw_request(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+
+    tracing::debug!("=== RAW REQUEST MIDDLEWARE ===");
+    tracing::debug!("Method: {}", method);
+    tracing::debug!("URI: {}", uri);
+    tracing::debug!("URI path: {}", uri.path());
+    tracing::debug!("URI query: {:?}", uri.query());
+    if let Some(q) = uri.query() {
+        tracing::debug!("URI query bytes: {}", hex::encode(q.as_bytes()));
+    }
+
+    next.run(req).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5376,21 +5393,4 @@ mod tests {
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("AccessDenied"));
     }
-}
-
-/// Middleware to log raw request URI before any processing
-async fn log_raw_request(req: Request, next: Next) -> Response {
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-
-    tracing::debug!("=== RAW REQUEST MIDDLEWARE ===");
-    tracing::debug!("Method: {}", method);
-    tracing::debug!("URI: {}", uri);
-    tracing::debug!("URI path: {}", uri.path());
-    tracing::debug!("URI query: {:?}", uri.query());
-    if let Some(q) = uri.query() {
-        tracing::debug!("URI query bytes: {}", hex::encode(q.as_bytes()));
-    }
-
-    next.run(req).await
 }

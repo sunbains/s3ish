@@ -61,6 +61,7 @@ static METADATA_POOL: Lazy<ArrayQueue<ObjectMetadata>> = Lazy::new(|| {
 
 /// Get ObjectMetadata from global pool (zero-copy) or allocate new
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn get_pooled_metadata(
     content_type: String,
     etag: String,
@@ -111,6 +112,7 @@ fn get_pooled_metadata(
 
 /// Return ObjectMetadata to global pool for reuse (best effort)
 #[inline]
+#[allow(dead_code)]
 fn return_pooled_metadata(meta: ObjectMetadata) {
     let _ = METADATA_POOL.push(meta);
 }

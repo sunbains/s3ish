@@ -171,17 +171,6 @@ impl FsStoreActor {
         p
     }
 
-    fn shard_dir(&self, obj_path: &Path) -> PathBuf {
-        let mut p = obj_path.to_path_buf();
-        let file_name = p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("obj")
-            .to_string();
-        p.set_file_name(format!("{file_name}.shards"));
-        p
-    }
-
     fn shard_dir_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
         let obj_path = self.object_path_on_drive(drive, bucket, key);
         let mut p = obj_path;

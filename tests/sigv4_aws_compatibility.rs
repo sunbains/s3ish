@@ -1,10 +1,6 @@
 // Test AWS SigV4 compatibility using known-good signatures from AWS documentation
 // Reference: https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
 
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
-use tower::ServiceExt;
-
 // This is a test helper to create the test app - you'll need to import from your main test module
 // For now, I'll inline a minimal version
 

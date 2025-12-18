@@ -65,6 +65,30 @@ pub struct StorageConfig {
     /// I/O buffer configuration
     #[serde(default)]
     pub io: IoConfig,
+    /// Actor configuration
+    #[serde(default)]
+    pub actors: ActorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorConfig {
+    /// Number of parallel actors for concurrent processing
+    /// Higher values = better throughput but more memory/CPU
+    /// Recommended: 3-8 for most systems
+    #[serde(default = "default_num_actors")]
+    pub num_actors: usize,
+}
+
+impl Default for ActorConfig {
+    fn default() -> Self {
+        Self {
+            num_actors: default_num_actors(),
+        }
+    }
+}
+
+fn default_num_actors() -> usize {
+    8
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +166,7 @@ impl Default for StorageConfig {
             erasure: ErasureConfig::default(),
             cache: CacheConfig::default(),
             io: IoConfig::default(),
+            actors: ActorConfig::default(),
         }
     }
 }

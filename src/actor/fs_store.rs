@@ -31,11 +31,13 @@ use tokio::sync::mpsc;
 
 use crate::actor::messages::FsCommand;
 use crate::actor::metrics::Metrics;
+use crate::observability::metrics as prom_metrics;
 use crate::storage::common::{validate_bucket, validate_key};
 use crate::storage::erasure::Erasure;
 use crate::storage::{ObjectMetadata, StorageError};
 
 const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks
+const SMALL_OBJECT_THRESHOLD: usize = 128 * 1024; // 128KB - store inline without sharding
 
 /// Metadata stored on disk (includes erasure coding params)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +104,9 @@ pub struct FsStoreActor {
 
     /// Lock-free metrics
     metrics: Arc<Metrics>,
+
+    /// Cache of created directories (optimization)
+    created_dirs: std::collections::HashSet<PathBuf>,
 }
 
 impl FsStoreActor {
@@ -123,6 +128,7 @@ impl FsStoreActor {
             erasure,
             rx,
             metrics,
+            created_dirs: std::collections::HashSet::new(),
         }
     }
 
@@ -203,43 +209,59 @@ impl FsStoreActor {
 
             match cmd {
                 FsCommand::PutObject { bucket, key, data, headers, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_put_object(&bucket, &key, data, headers).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("put_object", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::GetObject { bucket, key, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_get_object(&bucket, &key).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("get_object", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::HeadObject { bucket, key, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_head_object(&bucket, &key).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("head_object", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::DeleteObject { bucket, key, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_delete_object(&bucket, &key).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("delete_object", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::ListObjects { bucket, prefix, limit, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_list_objects(&bucket, &prefix, limit).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("list_objects", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::CreateBucket { bucket, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_create_bucket(&bucket).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("create_bucket", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::DeleteBucket { bucket, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_delete_bucket(&bucket).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("delete_bucket", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::ListBuckets { reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_list_buckets().await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("list_buckets", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::CopyObject {
@@ -250,15 +272,19 @@ impl FsStoreActor {
                     headers,
                     reply,
                 } => {
+                    let op_start = std::time::Instant::now();
                     let res = self
                         .handle_copy_object(&src_bucket, &src_key, &dest_bucket, &dest_key, headers)
                         .await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("copy_object", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::InitiateMultipart { bucket, key, headers, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_initiate_multipart(&bucket, &key, headers).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("initiate_multipart", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::UploadPart {
@@ -267,18 +293,24 @@ impl FsStoreActor {
                     data,
                     reply,
                 } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_upload_part(&upload_id, part_number, data).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("upload_part", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::CompleteMultipart { upload_id, parts, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_complete_multipart(&upload_id, parts).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("complete_multipart", op_start.elapsed().as_secs_f64());
                 }
 
                 FsCommand::AbortMultipart { upload_id, reply } => {
+                    let op_start = std::time::Instant::now();
                     let res = self.handle_abort_multipart(&upload_id).await;
                     let _ = reply.send(res);
+                    prom_metrics::record_actor_op_total("abort_multipart", op_start.elapsed().as_secs_f64());
                 }
             }
         }
@@ -290,7 +322,7 @@ impl FsStoreActor {
     // For now, these are stubs that return "not implemented"
 
     async fn handle_put_object(
-        &self,
+        &mut self,
         bucket: &str,
         key: &str,
         data: Bytes,
@@ -313,12 +345,22 @@ impl FsStoreActor {
         // Get object paths (metadata goes on primary drive)
         let obj_path = self.object_path(bucket, key);
         if let Some(parent) = obj_path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|e| StorageError::Internal(format!("create parents: {e}")))?;
+            // Use directory cache to avoid redundant create_dir_all() calls
+            if !self.created_dirs.contains(parent) {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("create parents: {e}")))?;
+                self.created_dirs.insert(parent.to_path_buf());
+            }
         }
 
         let meta_path = self.meta_path(&obj_path);
+        let size = data.len() as u64;
+
+        // Fast path for small objects: store inline without erasure coding
+        if data.len() <= SMALL_OBJECT_THRESHOLD {
+            return self.handle_put_object_inline(bucket, key, data, headers, obj_path, meta_path, size).await;
+        }
 
         let parity_blocks = self.erasure.parity_blocks.max(1);
         let shard_count = self.erasure.data_blocks + parity_blocks;
@@ -377,11 +419,18 @@ impl FsStoreActor {
                 // Update BLAKE3 hash
                 hasher.update(slice);
 
-                // Write data
+                // Write data (with timing)
+                let drive = self.drive_for_shard(shard_idx);
+                let drive_name = drive.display().to_string();
+                let write_start = std::time::Instant::now();
+
                 files[shard_idx]
                     .write_all(slice)
                     .await
                     .map_err(|e| StorageError::Internal(format!("write shard {}: {e}", shard_idx)))?;
+
+                prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
+                prom_metrics::increment_disk_shard_ops("write", &drive_name);
 
                 // XOR into parity block
                 for (i, b) in slice.iter().enumerate() {
@@ -390,15 +439,23 @@ impl FsStoreActor {
             }
 
             // Write parity to all parity shards
-            for parity_file in files
+            for (idx, parity_file) in files
                 .iter_mut()
+                .enumerate()
                 .skip(self.erasure.data_blocks)
                 .take(parity_blocks)
             {
+                let drive = self.drive_for_shard(idx);
+                let drive_name = drive.display().to_string();
+                let write_start = std::time::Instant::now();
+
                 parity_file
                     .write_all(&parity_block)
                     .await
                     .map_err(|e| StorageError::Internal(format!("write parity: {e}")))?;
+
+                prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
+                prom_metrics::increment_disk_shard_ops("write", &drive_name);
             }
         }
 
@@ -421,6 +478,62 @@ impl FsStoreActor {
             data_blocks: Some(self.erasure.data_blocks),
             parity_blocks: Some(self.erasure.parity_blocks),
             block_size: Some(self.erasure.block_size),
+            storage_class: headers.storage_class,
+            server_side_encryption: headers.server_side_encryption,
+            version_id: None,
+            is_latest: true,
+            is_delete_marker: false,
+        };
+
+        // Write metadata
+        let meta_bytes =
+            serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
+        fs::write(&meta_path, meta_bytes)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write meta: {}", e)))?;
+
+        // Update metrics
+        self.metrics.inc_put();
+        self.metrics.add_bytes_in(size);
+
+        Ok(to_object_metadata(stored_meta))
+    }
+
+    // Fast path for small objects (<128KB): store inline without erasure coding
+    async fn handle_put_object_inline(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: Bytes,
+        headers: crate::actor::messages::ObjectHeaders,
+        obj_path: PathBuf,
+        meta_path: PathBuf,
+        size: u64,
+    ) -> Result<ObjectMetadata, StorageError> {
+        // Compute hash
+        let etag = blake3::hash(&data).to_hex().to_string();
+
+        // Write object data directly to a single file
+        let write_start = std::time::Instant::now();
+        fs::write(&obj_path, &data)
+            .await
+            .map_err(|e| StorageError::Internal(format!("write inline object: {}", e)))?;
+
+        let drive = self.primary_drive();
+        let drive_name = drive.display().to_string();
+        prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
+        prom_metrics::increment_disk_shard_ops("write", &drive_name);
+
+        // Create metadata (no erasure coding params)
+        let stored_meta = StoredMeta {
+            content_type: headers.content_type,
+            etag: etag.clone(),
+            size,
+            last_modified_unix_secs: Utc::now().timestamp(),
+            metadata: headers.metadata,
+            data_blocks: None,  // No sharding
+            parity_blocks: None,
+            block_size: None,
             storage_class: headers.storage_class,
             server_side_encryption: headers.server_side_encryption,
             version_id: None,
@@ -465,14 +578,22 @@ impl FsStoreActor {
         let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
             self.read_shards(bucket, key, db, pb, stored.size).await?
         } else {
-            // Fallback: read whole object (backward compatibility)
-            fs::read(&obj_path).await.map_err(|e| match e.kind() {
+            // Fast path for inline objects (no sharding)
+            let drive = self.primary_drive();
+            let drive_name = drive.display().to_string();
+            let read_start = std::time::Instant::now();
+
+            let data = fs::read(&obj_path).await.map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                 },
                 _ => StorageError::Internal(format!("read object: {e}")),
-            })?
+            })?;
+
+            prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+            prom_metrics::increment_disk_shard_ops("read", &drive_name);
+            data
         };
 
         // Update metrics
@@ -492,102 +613,107 @@ impl FsStoreActor {
     ) -> Result<Vec<u8>, StorageError> {
         let total = db + pb.max(1);
 
-        let mut out = Vec::with_capacity(size as usize);
-        let block_size = self.erasure.block_size;
+        // Read all data shards ONCE
+        let mut shard_data: Vec<Option<Vec<u8>>> = Vec::with_capacity(db);
+        for idx in 0..db {
+            let drive = self.drive_for_shard(idx);
+            let drive_name = drive.display().to_string();
+            let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+            let shard_path = shard_dir.join(format!("{}", idx));
 
-        let mut offset = 0usize;
-
-        while offset < size as usize {
-            // Read all shards for this block from their designated drives
-            let mut blocks: Vec<Option<Vec<u8>>> = vec![None; db];
-
-            for (idx, block) in blocks.iter_mut().enumerate().take(db) {
-                let drive = self.drive_for_shard(idx);
-                let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
-                let shard_path = shard_dir.join(format!("{}", idx));
-
-                match fs::read(&shard_path).await {
-                    Ok(data) => {
-                        let start = (offset / size as usize) * block_size;
-                        let end = std::cmp::min(start + block_size, data.len());
-                        if start < data.len() {
-                            *block = Some(data[start..end].to_vec());
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(StorageError::Internal(format!(
-                            "read shard {} from {:?}: {}",
-                            idx, drive, e
-                        )))
-                    }
-                }
-            }
-
-            // Read parity shard from its designated drive
-            let parity_idx = total - 1;
-            let parity_drive = self.drive_for_shard(parity_idx);
-            let parity_shard_dir = self.shard_dir_on_drive(parity_drive, bucket, key);
-            let parity_path = parity_shard_dir.join(format!("{}", parity_idx));
-
-            let parity_block = match fs::read(&parity_path).await {
+            let read_start = std::time::Instant::now();
+            match fs::read(&shard_path).await {
                 Ok(data) => {
-                    let start = (offset / size as usize) * block_size;
-                    let end = std::cmp::min(start + block_size, data.len());
-                    if start < data.len() {
-                        data[start..end].to_vec()
-                    } else {
-                        vec![0u8; block_size]
-                    }
+                    prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                    prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                    shard_data.push(Some(data));
                 }
-                Err(_) => {
-                    // Compute parity from data blocks
-                    let mut parity = vec![0u8; block_size];
-                    for b in blocks.iter().flatten() {
-                        for (i, byte) in b.iter().enumerate() {
-                            parity[i] ^= byte;
-                        }
-                    }
-                    parity
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    shard_data.push(None);
                 }
-            };
+                Err(e) => {
+                    return Err(StorageError::Internal(format!(
+                        "read shard {} from {:?}: {}",
+                        idx, drive, e
+                    )))
+                }
+            }
+        }
 
-            // Reconstruct missing shard if exactly one is missing
-            let missing_idx = blocks
-                .iter()
-                .enumerate()
-                .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
+        // Read parity shard ONCE
+        let parity_idx = total - 1;
+        let parity_drive = self.drive_for_shard(parity_idx);
+        let parity_drive_name = parity_drive.display().to_string();
+        let parity_shard_dir = self.shard_dir_on_drive(parity_drive, bucket, key);
+        let parity_path = parity_shard_dir.join(format!("{}", parity_idx));
 
-            if let Some(miss) = missing_idx {
-                if pb == 0 {
-                    return Err(StorageError::Internal("missing shard with no parity".into()));
-                }
-                // XOR all other blocks with parity to recover missing block
-                let mut rec = parity_block.clone();
-                for (i, blk) in blocks.iter().enumerate() {
-                    if i != miss {
-                        if let Some(b) = blk {
-                            for (j, byte) in b.iter().enumerate() {
-                                rec[j] ^= byte;
-                            }
-                        }
-                    }
-                }
-                blocks[miss] = Some(rec);
+        let parity_read_start = std::time::Instant::now();
+        let parity_data = match fs::read(&parity_path).await {
+            Ok(data) => {
+                prom_metrics::record_disk_shard_read(&parity_drive_name, parity_read_start.elapsed().as_secs_f64());
+                prom_metrics::increment_disk_shard_ops("read", &parity_drive_name);
+                Some(data)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(StorageError::Internal(format!(
+                    "read parity shard from {:?}: {}",
+                    parity_drive, e
+                )))
+            }
+        };
+
+        // Check if we need to reconstruct a missing shard
+        let missing_idx = shard_data
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| if s.is_none() { Some(i) } else { None });
+
+        if let Some(miss) = missing_idx {
+            if pb == 0 || parity_data.is_none() {
+                return Err(StorageError::Internal("missing shard with no parity".into()));
             }
 
-            // Append blocks to output
-            for mut b in blocks.into_iter().flatten() {
-                if out.len() + b.len() > size as usize {
-                    b.truncate(size as usize - out.len());
+            // Reconstruct missing shard using XOR with parity
+            let parity = parity_data.as_ref().unwrap();
+            let shard_len = shard_data.iter().flatten().next().map(|s| s.len()).unwrap_or(parity.len());
+            let mut reconstructed = vec![0u8; shard_len];
+
+            // Start with parity
+            for (i, &byte) in parity.iter().take(shard_len).enumerate() {
+                reconstructed[i] = byte;
+            }
+
+            // XOR with all other data shards
+            for (i, shard_opt) in shard_data.iter().enumerate() {
+                if i != miss {
+                    if let Some(shard) = shard_opt {
+                        for (j, &byte) in shard.iter().take(shard_len).enumerate() {
+                            reconstructed[j] ^= byte;
+                        }
+                    }
                 }
-                out.extend_from_slice(&b);
+            }
+
+            shard_data[miss] = Some(reconstructed);
+        }
+
+        // Concatenate all shards to reconstruct the object
+        let mut out = Vec::with_capacity(size as usize);
+        for shard_opt in shard_data.iter() {
+            if let Some(shard) = shard_opt {
+                let remaining = size as usize - out.len();
+                let to_copy = std::cmp::min(shard.len(), remaining);
+                out.extend_from_slice(&shard[..to_copy]);
+
                 if out.len() >= size as usize {
                     break;
                 }
             }
-            offset = out.len();
         }
+
+        // Truncate to exact size
+        out.truncate(size as usize);
 
         Ok(out)
     }
@@ -727,7 +853,7 @@ impl FsStoreActor {
         Ok(())
     }
 
-    async fn handle_create_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+    async fn handle_create_bucket(&mut self, bucket: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
 
         let bucket_path = self.bucket_path(bucket);
@@ -745,7 +871,7 @@ impl FsStoreActor {
         Ok(true)
     }
 
-    async fn handle_delete_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+    async fn handle_delete_bucket(&mut self, bucket: &str) -> Result<bool, StorageError> {
         validate_bucket(bucket)?;
 
         let bucket_path = self.bucket_path(bucket);
@@ -763,7 +889,7 @@ impl FsStoreActor {
         Ok(true)
     }
 
-    async fn handle_list_buckets(&self) -> Result<Vec<String>, StorageError> {
+    async fn handle_list_buckets(&mut self) -> Result<Vec<String>, StorageError> {
         let mut buckets = Vec::new();
         let mut entries = match fs::read_dir(self.primary_drive()).await {
             Ok(e) => e,

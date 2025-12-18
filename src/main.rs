@@ -69,8 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize actor system and storage
     let storage: Arc<dyn StorageBackend> = match cfg.storage.backend.as_str() {
         "file" => {
-            let actor_metrics = Arc::new(ActorMetrics::new());
-            let (fs_tx, fs_rx) = mpsc::channel(10000);
+            // Spawn multiple actors for parallel processing
+            let num_actors = cfg.storage.actors.num_actors;
+            let mut actor_channels = Vec::new();
 
             // Use all configured drives for multi-drive sharding
             let drives: Vec<std::path::PathBuf> = cfg
@@ -80,18 +81,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| s.into())
                 .collect();
 
-            let actor = FsStoreActor::new(
-                drives,
-                cfg.storage.erasure.data_blocks,
-                cfg.storage.erasure.parity_blocks,
-                fs_rx,
-                actor_metrics.clone(),
-            );
+            for i in 0..num_actors {
+                let actor_metrics = Arc::new(ActorMetrics::new());
+                let (fs_tx, fs_rx) = mpsc::channel(10000);
 
-            tokio::spawn(actor.run());
-            tracing::info!("FsStoreActor started (actor model, multi-drive)");
+                let actor = FsStoreActor::new(
+                    drives.clone(),
+                    cfg.storage.erasure.data_blocks,
+                    cfg.storage.erasure.parity_blocks,
+                    fs_rx,
+                    actor_metrics.clone(),
+                );
 
-            Arc::new(ActorStorageBackend::new(fs_tx))
+                tokio::spawn(actor.run());
+                actor_channels.push(fs_tx);
+
+                tracing::info!("FsStoreActor {} started", i);
+            }
+
+            tracing::info!("FsStoreActor started (actor model, multi-drive, {} actors)", num_actors);
+
+            Arc::new(ActorStorageBackend::new(actor_channels))
         }
         _ => Arc::new(InMemoryStorage::new()),
     };

@@ -210,6 +210,49 @@ lazy_static! {
         "Number of concurrent requests being processed",
         &["protocol"]
     ).unwrap();
+
+    // ============================================================================
+    // Actor & Disk I/O Metrics (Detailed Performance Breakdown)
+    // ============================================================================
+
+    /// Actor message queue wait time
+    pub static ref ACTOR_QUEUE_WAIT_DURATION: HistogramVec = register_histogram_vec!(
+        "actor_queue_wait_duration_seconds",
+        "Time spent waiting in actor message queue",
+        &["actor_type"],
+        vec![0.00001, 0.0001, 0.0005, 0.001, 0.005, 0.010, 0.025, 0.050, 0.100]
+    ).unwrap();
+
+    /// Disk shard write duration (individual shard file writes)
+    pub static ref DISK_SHARD_WRITE_DURATION: HistogramVec = register_histogram_vec!(
+        "disk_shard_write_duration_seconds",
+        "Time to write a single shard to disk",
+        &["drive"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.500]
+    ).unwrap();
+
+    /// Disk shard read duration (individual shard file reads)
+    pub static ref DISK_SHARD_READ_DURATION: HistogramVec = register_histogram_vec!(
+        "disk_shard_read_duration_seconds",
+        "Time to read a single shard from disk",
+        &["drive"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.500]
+    ).unwrap();
+
+    /// Total shards written/read
+    pub static ref DISK_SHARD_OPS_TOTAL: CounterVec = register_counter_vec!(
+        "disk_shard_ops_total",
+        "Total number of shard file operations",
+        &["operation", "drive"]
+    ).unwrap();
+
+    /// Actor total operation duration (end-to-end)
+    pub static ref ACTOR_OP_TOTAL_DURATION: HistogramVec = register_histogram_vec!(
+        "actor_operation_total_duration_seconds",
+        "Total actor operation duration (queue + processing)",
+        &["operation"],
+        vec![0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0]
+    ).unwrap();
 }
 
 // ============================================================================
@@ -356,6 +399,41 @@ pub fn inc_concurrent_requests(protocol: &str) {
 /// Decrement concurrent requests
 pub fn dec_concurrent_requests(protocol: &str) {
     CONCURRENT_REQUESTS.with_label_values(&[protocol]).dec();
+}
+
+/// Record actor queue wait duration
+pub fn record_actor_queue_wait(actor_type: &str, duration: f64) {
+    ACTOR_QUEUE_WAIT_DURATION
+        .with_label_values(&[actor_type])
+        .observe(duration);
+}
+
+/// Record disk shard write duration
+pub fn record_disk_shard_write(drive: &str, duration: f64) {
+    DISK_SHARD_WRITE_DURATION
+        .with_label_values(&[drive])
+        .observe(duration);
+}
+
+/// Record disk shard read duration
+pub fn record_disk_shard_read(drive: &str, duration: f64) {
+    DISK_SHARD_READ_DURATION
+        .with_label_values(&[drive])
+        .observe(duration);
+}
+
+/// Increment disk shard operation counter
+pub fn increment_disk_shard_ops(operation: &str, drive: &str) {
+    DISK_SHARD_OPS_TOTAL
+        .with_label_values(&[operation, drive])
+        .inc();
+}
+
+/// Record actor total operation duration
+pub fn record_actor_op_total(operation: &str, duration: f64) {
+    ACTOR_OP_TOTAL_DURATION
+        .with_label_values(&[operation])
+        .observe(duration);
 }
 
 /// Gather all metrics for Prometheus exposition

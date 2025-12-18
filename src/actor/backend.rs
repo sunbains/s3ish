@@ -24,26 +24,48 @@ use crate::actor::messages::{FsCommand, ObjectHeaders};
 use crate::storage::{ObjectMetadata, StorageBackend, StorageError};
 
 /// Storage backend that delegates to FsStoreActor via message passing
+/// Supports multiple actors for parallel processing
 #[derive(Clone)]
 pub struct ActorStorageBackend {
-    tx: mpsc::Sender<FsCommand>,
+    actors: Vec<mpsc::Sender<FsCommand>>,
 }
 
 impl ActorStorageBackend {
-    /// Create a new ActorStorageBackend
-    pub fn new(tx: mpsc::Sender<FsCommand>) -> Self {
-        Self { tx }
+    /// Create a new ActorStorageBackend with multiple actors
+    pub fn new(actors: Vec<mpsc::Sender<FsCommand>>) -> Self {
+        assert!(!actors.is_empty(), "At least one actor required");
+        Self { actors }
     }
 
-    /// Send a command and wait for response
+    /// Get actor for a specific key (consistent hashing)
+    fn actor_for_key(&self, key: &str) -> &mpsc::Sender<FsCommand> {
+        if self.actors.len() == 1 {
+            return &self.actors[0];
+        }
+
+        // Simple hash-based sharding
+        let hash = key.bytes().fold(0u64, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(b as u64)
+        });
+        let idx = (hash % self.actors.len() as u64) as usize;
+        &self.actors[idx]
+    }
+
+    /// Get primary actor (for bucket operations)
+    fn primary_actor(&self) -> &mpsc::Sender<FsCommand> {
+        &self.actors[0]
+    }
+
+    /// Send a command to a specific actor and wait for response
     async fn send_command<T>(
         &self,
+        actor_tx: &mpsc::Sender<FsCommand>,
         make_command: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> FsCommand,
     ) -> Result<T, StorageError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = make_command(reply_tx);
 
-        self.tx
+        actor_tx
             .send(cmd)
             .await
             .map_err(|_| StorageError::Internal("Actor channel closed".to_string()))?;
@@ -66,6 +88,7 @@ impl StorageBackend for ActorStorageBackend {
         storage_class: Option<String>,
         server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let bucket = bucket.to_string();
         let key = key.to_string();
         let headers = ObjectHeaders {
@@ -75,7 +98,7 @@ impl StorageBackend for ActorStorageBackend {
             server_side_encryption,
         };
 
-        self.send_command(|reply| FsCommand::PutObject {
+        self.send_command(actor_tx, |reply| FsCommand::PutObject {
             bucket,
             key,
             data,
@@ -90,26 +113,29 @@ impl StorageBackend for ActorStorageBackend {
         bucket: &str,
         key: &str,
     ) -> Result<(Bytes, ObjectMetadata), StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let bucket = bucket.to_string();
         let key = key.to_string();
 
-        self.send_command(|reply| FsCommand::GetObject { bucket, key, reply })
+        self.send_command(actor_tx, |reply| FsCommand::GetObject { bucket, key, reply })
             .await
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let bucket = bucket.to_string();
         let key = key.to_string();
 
-        self.send_command(|reply| FsCommand::HeadObject { bucket, key, reply })
+        self.send_command(actor_tx, |reply| FsCommand::HeadObject { bucket, key, reply })
             .await
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let bucket = bucket.to_string();
         let key = key.to_string();
 
-        self.send_command(|reply| FsCommand::DeleteObject { bucket, key, reply })
+        self.send_command(actor_tx, |reply| FsCommand::DeleteObject { bucket, key, reply })
             .await
     }
 
@@ -119,10 +145,12 @@ impl StorageBackend for ActorStorageBackend {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, ObjectMetadata)>, StorageError> {
+        // List objects from primary actor (simplified - could aggregate across all actors)
+        let actor_tx = self.primary_actor();
         let bucket = bucket.to_string();
         let prefix = prefix.to_string();
 
-        self.send_command(|reply| FsCommand::ListObjects {
+        self.send_command(actor_tx, |reply| FsCommand::ListObjects {
             bucket,
             prefix,
             limit,
@@ -132,21 +160,24 @@ impl StorageBackend for ActorStorageBackend {
     }
 
     async fn create_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+        let actor_tx = self.primary_actor();
         let bucket = bucket.to_string();
 
-        self.send_command(|reply| FsCommand::CreateBucket { bucket, reply })
+        self.send_command(actor_tx, |reply| FsCommand::CreateBucket { bucket, reply })
             .await
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+        let actor_tx = self.primary_actor();
         let bucket = bucket.to_string();
 
-        self.send_command(|reply| FsCommand::DeleteBucket { bucket, reply })
+        self.send_command(actor_tx, |reply| FsCommand::DeleteBucket { bucket, reply })
             .await
     }
 
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
-        self.send_command(|reply| FsCommand::ListBuckets { reply })
+        let actor_tx = self.primary_actor();
+        self.send_command(actor_tx, |reply| FsCommand::ListBuckets { reply })
             .await
     }
 
@@ -161,6 +192,7 @@ impl StorageBackend for ActorStorageBackend {
         storage_class: Option<String>,
         server_side_encryption: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
+        let actor_tx = self.actor_for_key(dest_key);
         let src_bucket = src_bucket.to_string();
         let src_key = src_key.to_string();
         let dest_bucket = dest_bucket.to_string();
@@ -172,7 +204,7 @@ impl StorageBackend for ActorStorageBackend {
             server_side_encryption,
         };
 
-        self.send_command(|reply| FsCommand::CopyObject {
+        self.send_command(actor_tx, |reply| FsCommand::CopyObject {
             src_bucket,
             src_key,
             dest_bucket,
@@ -188,6 +220,7 @@ impl StorageBackend for ActorStorageBackend {
         bucket: &str,
         key: &str,
     ) -> Result<String, StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let bucket = bucket.to_string();
         let key = key.to_string();
         let headers = ObjectHeaders {
@@ -197,7 +230,7 @@ impl StorageBackend for ActorStorageBackend {
             server_side_encryption: None,
         };
 
-        self.send_command(|reply| FsCommand::InitiateMultipart {
+        self.send_command(actor_tx, |reply| FsCommand::InitiateMultipart {
             bucket,
             key,
             headers,
@@ -209,14 +242,15 @@ impl StorageBackend for ActorStorageBackend {
     async fn upload_part(
         &self,
         _bucket: &str,
-        _key: &str,
+        key: &str,
         upload_id: &str,
         part_number: u32,
         data: Bytes,
     ) -> Result<String, StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let upload_id = upload_id.to_string();
 
-        self.send_command(|reply| FsCommand::UploadPart {
+        self.send_command(actor_tx, |reply| FsCommand::UploadPart {
             upload_id,
             part_number,
             data,
@@ -228,13 +262,14 @@ impl StorageBackend for ActorStorageBackend {
     async fn complete_multipart(
         &self,
         _bucket: &str,
-        _key: &str,
+        key: &str,
         upload_id: &str,
         parts: Vec<(u32, String)>,
     ) -> Result<ObjectMetadata, StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let upload_id = upload_id.to_string();
 
-        self.send_command(|reply| FsCommand::CompleteMultipart {
+        self.send_command(actor_tx, |reply| FsCommand::CompleteMultipart {
             upload_id,
             parts,
             reply,
@@ -245,12 +280,13 @@ impl StorageBackend for ActorStorageBackend {
     async fn abort_multipart(
         &self,
         _bucket: &str,
-        _key: &str,
+        key: &str,
         upload_id: &str,
     ) -> Result<(), StorageError> {
+        let actor_tx = self.actor_for_key(key);
         let upload_id = upload_id.to_string();
 
-        self.send_command(|reply| FsCommand::AbortMultipart { upload_id, reply })
+        self.send_command(actor_tx, |reply| FsCommand::AbortMultipart { upload_id, reply })
             .await
     }
 

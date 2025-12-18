@@ -24,9 +24,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
+use crossbeam_queue::ArrayQueue;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 
 use crate::actor::messages::FsCommand;
@@ -38,6 +40,58 @@ use crate::storage::{ObjectMetadata, StorageError};
 
 const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks
 const SMALL_OBJECT_THRESHOLD: usize = 128 * 1024; // 128KB - store inline without sharding
+
+/// Global buffer pool for reusing allocations
+/// Similar to Go's sync.Pool, reduces GC pressure and improves performance
+static BUFFER_POOL: Lazy<ArrayQueue<Vec<u8>>> = Lazy::new(|| {
+    ArrayQueue::new(256) // Pool capacity = 256 buffers
+});
+
+/// Acquire a buffer from the pool, or allocate a new one if pool is empty
+/// Returns a Vec with length=size, filled with zeros
+fn acquire_buffer(size: usize) -> Vec<u8> {
+    BUFFER_POOL.pop()
+        .and_then(|mut buf| {
+            if buf.capacity() >= size {
+                // Buffer is large enough, resize and clear
+                buf.clear();
+                buf.resize(size, 0);
+                Some(buf)
+            } else {
+                // Buffer too small, return to pool and allocate fresh
+                let _ = BUFFER_POOL.push(buf);
+                None
+            }
+        })
+        .unwrap_or_else(|| vec![0u8; size])
+}
+
+/// Acquire a buffer from the pool with reserved capacity but zero length
+/// Used for buffers that will be filled with extend_from_slice()
+fn acquire_buffer_with_capacity(capacity: usize) -> Vec<u8> {
+    BUFFER_POOL.pop()
+        .and_then(|mut buf| {
+            if buf.capacity() >= capacity {
+                // Buffer is large enough, clear it (length becomes 0)
+                buf.clear();
+                Some(buf)
+            } else {
+                // Buffer too small, return to pool and allocate fresh
+                let _ = BUFFER_POOL.push(buf);
+                None
+            }
+        })
+        .unwrap_or_else(|| Vec::with_capacity(capacity))
+}
+
+/// Return a buffer to the pool for reuse
+fn release_buffer(buf: Vec<u8>) {
+    // Only pool buffers that are reasonably sized (not massive outliers)
+    if buf.capacity() <= 10 * 1024 * 1024 { // Max 10MB buffers in pool
+        let _ = BUFFER_POOL.push(buf); // Drop if pool is full
+    }
+    // Otherwise, drop the buffer (let it deallocate)
+}
 
 /// Metadata stored on disk (includes erasure coding params)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,8 +134,17 @@ fn to_object_metadata(meta: StoredMeta) -> ObjectMetadata {
     }
 }
 
+/// Helper function to read a file with buffering for better performance
+async fn read_file_buffered(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let file = fs::File::open(path).await?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file); // 1MB buffer
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data).await?;
+    Ok(data)
+}
+
 async fn read_stored_meta(meta_path: &Path) -> Result<StoredMeta, StorageError> {
-    let data = fs::read(meta_path)
+    let data = read_file_buffered(meta_path)
         .await
         .map_err(|e| StorageError::Internal(format!("read meta: {}", e)))?;
     serde_json::from_slice(&data)
@@ -400,7 +463,7 @@ impl FsStoreActor {
         let stripe_size = self.erasure.block_size * self.erasure.data_blocks;
 
         for stripe_start in (0..data.len()).step_by(stripe_size) {
-            let mut parity_block = vec![0u8; self.erasure.block_size];
+            let mut parity_block = acquire_buffer(self.erasure.block_size);
 
             let stripe_end = std::cmp::min(stripe_start + stripe_size, data.len());
             let stripe_data_len = stripe_end - stripe_start;
@@ -457,6 +520,9 @@ impl FsStoreActor {
                 prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
                 prom_metrics::increment_disk_shard_ops("write", &drive_name);
             }
+
+            // Return parity_block to pool
+            release_buffer(parity_block);
         }
 
         // Flush all files
@@ -502,8 +568,8 @@ impl FsStoreActor {
     // Fast path for small objects (<128KB): store inline without erasure coding
     async fn handle_put_object_inline(
         &self,
-        bucket: &str,
-        key: &str,
+        _bucket: &str,
+        _key: &str,
         data: Bytes,
         headers: crate::actor::messages::ObjectHeaders,
         obj_path: PathBuf,
@@ -583,7 +649,7 @@ impl FsStoreActor {
             let drive_name = drive.display().to_string();
             let read_start = std::time::Instant::now();
 
-            let data = fs::read(&obj_path).await.map_err(|e| match e.kind() {
+            let data = read_file_buffered(&obj_path).await.map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
@@ -611,104 +677,136 @@ impl FsStoreActor {
         pb: usize,
         size: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        let total = db + pb.max(1);
+        use tokio::io::AsyncReadExt;
 
-        // Read all data shards ONCE
-        let mut shard_data: Vec<Option<Vec<u8>>> = Vec::with_capacity(db);
-        for idx in 0..db {
+        let total = db + pb.max(1);
+        let block_size = 1024 * 1024; // 1MB blocks for streaming
+        let mut out = acquire_buffer_with_capacity(size as usize);
+
+        // Open all shard files with BufReader for streaming
+        let mut readers: Vec<Option<(BufReader<fs::File>, String)>> = Vec::with_capacity(total);
+
+        for idx in 0..total {
             let drive = self.drive_for_shard(idx);
             let drive_name = drive.display().to_string();
             let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
             let shard_path = shard_dir.join(format!("{}", idx));
 
-            let read_start = std::time::Instant::now();
-            match fs::read(&shard_path).await {
-                Ok(data) => {
-                    prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
-                    prom_metrics::increment_disk_shard_ops("read", &drive_name);
-                    shard_data.push(Some(data));
+            match fs::File::open(&shard_path).await {
+                Ok(f) => {
+                    let reader = BufReader::with_capacity(block_size, f);
+                    readers.push(Some((reader, drive_name)));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    shard_data.push(None);
+                    readers.push(None);
                 }
                 Err(e) => {
                     return Err(StorageError::Internal(format!(
-                        "read shard {} from {:?}: {}",
+                        "open shard {} from {:?}: {}",
                         idx, drive, e
                     )))
                 }
             }
         }
 
-        // Read parity shard ONCE
-        let parity_idx = total - 1;
-        let parity_drive = self.drive_for_shard(parity_idx);
-        let parity_drive_name = parity_drive.display().to_string();
-        let parity_shard_dir = self.shard_dir_on_drive(parity_drive, bucket, key);
-        let parity_path = parity_shard_dir.join(format!("{}", parity_idx));
+        let mut bytes_read = 0u64;
 
-        let parity_read_start = std::time::Instant::now();
-        let parity_data = match fs::read(&parity_path).await {
-            Ok(data) => {
-                prom_metrics::record_disk_shard_read(&parity_drive_name, parity_read_start.elapsed().as_secs_f64());
-                prom_metrics::increment_disk_shard_ops("read", &parity_drive_name);
-                Some(data)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(StorageError::Internal(format!(
-                    "read parity shard from {:?}: {}",
-                    parity_drive, e
-                )))
-            }
-        };
+        // Stream blocks from all shards
+        while bytes_read < size {
+            let mut blocks: Vec<Option<Vec<u8>>> = vec![None; db];
+            let parity_idx = total - 1;
 
-        // Check if we need to reconstruct a missing shard
-        let missing_idx = shard_data
-            .iter()
-            .enumerate()
-            .find_map(|(i, s)| if s.is_none() { Some(i) } else { None });
+            // Read one block from each data shard
+            for idx in 0..db {
+                if let Some((reader, drive_name)) = &mut readers[idx] {
+                    let mut buf = vec![0u8; block_size];
+                    let read_start = std::time::Instant::now();
 
-        if let Some(miss) = missing_idx {
-            if pb == 0 || parity_data.is_none() {
-                return Err(StorageError::Internal("missing shard with no parity".into()));
-            }
-
-            // Reconstruct missing shard using XOR with parity
-            let parity = parity_data.as_ref().unwrap();
-            let shard_len = shard_data.iter().flatten().next().map(|s| s.len()).unwrap_or(parity.len());
-            let mut reconstructed = vec![0u8; shard_len];
-
-            // Start with parity
-            for (i, &byte) in parity.iter().take(shard_len).enumerate() {
-                reconstructed[i] = byte;
-            }
-
-            // XOR with all other data shards
-            for (i, shard_opt) in shard_data.iter().enumerate() {
-                if i != miss {
-                    if let Some(shard) = shard_opt {
-                        for (j, &byte) in shard.iter().take(shard_len).enumerate() {
-                            reconstructed[j] ^= byte;
+                    match reader.read(&mut buf).await {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            if n > 0 {
+                                prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                                prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                                blocks[idx] = Some(buf);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(StorageError::Internal(format!("read shard {}: {}", idx, e)))
                         }
                     }
                 }
             }
 
-            shard_data[miss] = Some(reconstructed);
-        }
+            // Read one block from parity shard
+            let mut parity_block: Option<Vec<u8>> = None;
+            if let Some((reader, drive_name)) = &mut readers[parity_idx] {
+                let mut buf = vec![0u8; block_size];
+                let read_start = std::time::Instant::now();
 
-        // Concatenate all shards to reconstruct the object
-        let mut out = Vec::with_capacity(size as usize);
-        for shard_opt in shard_data.iter() {
-            if let Some(shard) = shard_opt {
-                let remaining = size as usize - out.len();
-                let to_copy = std::cmp::min(shard.len(), remaining);
-                out.extend_from_slice(&shard[..to_copy]);
-
-                if out.len() >= size as usize {
-                    break;
+                match reader.read(&mut buf).await {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        if n > 0 {
+                            prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                            prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                            parity_block = Some(buf);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(StorageError::Internal(format!("read parity: {}", e)))
+                    }
                 }
+            }
+
+            // Check for missing shard in this stripe
+            let missing_idx = blocks.iter().enumerate()
+                .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
+
+            if let Some(miss) = missing_idx {
+                // Reconstruct missing block using XOR
+                if pb == 0 || parity_block.is_none() {
+                    return Err(StorageError::Internal("missing shard with no parity".into()));
+                }
+
+                let parity = parity_block.as_ref().unwrap();
+                let block_len = blocks.iter().flatten().next().map(|b| b.len()).unwrap_or(parity.len());
+                let mut reconstructed = vec![0u8; block_len];
+
+                // Start with parity
+                reconstructed[..parity.len().min(block_len)].copy_from_slice(&parity[..parity.len().min(block_len)]);
+
+                // XOR with all other blocks
+                for (i, block_opt) in blocks.iter().enumerate() {
+                    if i != miss {
+                        if let Some(block) = block_opt {
+                            for (j, &byte) in block.iter().enumerate().take(block_len) {
+                                reconstructed[j] ^= byte;
+                            }
+                        }
+                    }
+                }
+
+                blocks[miss] = Some(reconstructed);
+            }
+
+            // Concatenate blocks into output
+            for block_opt in blocks.iter() {
+                if let Some(block) = block_opt {
+                    let remaining = size as usize - out.len();
+                    let to_copy = std::cmp::min(block.len(), remaining);
+                    out.extend_from_slice(&block[..to_copy]);
+                    bytes_read += to_copy as u64;
+
+                    if out.len() >= size as usize {
+                        break;
+                    }
+                }
+            }
+
+            // Check if all shards are exhausted
+            if blocks.iter().all(|b| b.is_none()) {
+                break;
             }
         }
 

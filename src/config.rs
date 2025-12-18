@@ -68,6 +68,9 @@ pub struct StorageConfig {
     /// Actor configuration
     #[serde(default)]
     pub actors: ActorConfig,
+    /// WAL (Write-Ahead Log) configuration
+    #[serde(default)]
+    pub wal: WalConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +92,25 @@ impl Default for ActorConfig {
 
 fn default_num_actors() -> usize {
     8
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WalConfig {
+    /// Checkpoint interval in seconds (0 = disabled, default = 1)
+    #[serde(default = "default_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_interval_secs: default_checkpoint_interval_secs(),
+        }
+    }
+}
+
+fn default_checkpoint_interval_secs() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,6 +189,7 @@ impl Default for StorageConfig {
             cache: CacheConfig::default(),
             io: IoConfig::default(),
             actors: ActorConfig::default(),
+            wal: WalConfig::default(),
         }
     }
 }

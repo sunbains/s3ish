@@ -14,7 +14,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::{collections::HashMap, any::Any};
 use thiserror::Error;
 
 pub mod bucket_policy;
@@ -24,6 +24,7 @@ pub mod file_storage;
 pub mod in_memory;
 pub mod lifecycle;
 pub mod lifecycle_executor;
+pub mod metadata;
 pub mod multipart;
 pub mod versioning;
 pub mod writeback_cache;
@@ -74,6 +75,14 @@ pub enum StorageError {
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait StorageBackend: Send + Sync + 'static {
+    /// Downcast hook for optional extensions (e.g., sendfile support).
+    fn as_any(&self) -> &(dyn Any + Send + Sync)
+    where
+        Self: Sized,
+    {
+        self
+    }
+
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError>;
     async fn create_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
     async fn delete_bucket(&self, bucket: &str) -> Result<bool, StorageError>;
@@ -212,4 +221,21 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> Result<(), StorageError>;
 
     async fn delete_bucket_policy(&self, bucket: &str) -> Result<bool, StorageError>;
+
+    /// Optional: direct file handle for zero-copy/streaming paths.
+    /// Default returns None; implementations can override to enable sendfile-like handling.
+    async fn open_for_sendfile(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Option<Result<SendfileObject, StorageError>> {
+        None
+    }
+}
+
+/// File handle + metadata for direct streaming/sendfile use.
+#[derive(Debug)]
+pub struct SendfileObject {
+    pub path: std::path::PathBuf,
+    pub metadata: ObjectMetadata,
 }

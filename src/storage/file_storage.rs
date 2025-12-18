@@ -519,18 +519,32 @@ impl FileStorage {
                 blocks[miss] = Some(rec);
             }
 
-            // Append blocks to output
-            for mut b in blocks.into_iter().flatten() {
-                if out.len() + b.len() > size as usize {
-                    b.truncate(size as usize - out.len());
-                }
+            // Calculate stripe data length (how much data in this stripe)
+            let stripe_data_len = (size as usize - offset).min(block_size * db);
+
+            // Calculate chunk size per shard (same as during write)
+            let chunk_size = stripe_data_len.div_ceil(db);
+
+            // Append blocks to output, removing padding from each block
+            for (shard_idx, mut b) in blocks.into_iter().enumerate().filter_map(|(i, b)| b.map(|b| (i, b))) {
+                // Calculate how much data this shard should contribute
+                let shard_start_in_stripe = shard_idx * chunk_size;
+                let bytes_to_take = if shard_start_in_stripe >= stripe_data_len {
+                    0  // This shard has no data in this stripe
+                } else {
+                    (stripe_data_len - shard_start_in_stripe).min(chunk_size).min(b.len())
+                };
+
+                // Truncate to remove padding
+                b.truncate(bytes_to_take);
+
                 out.extend_from_slice(&b);
-                if out.len() >= size as usize {
-                    break;
-                }
             }
             offset = out.len();
         }
+
+        // Ensure output is exactly the requested size (final safety check)
+        out.truncate(size as usize);
         Ok(out)
     }
 

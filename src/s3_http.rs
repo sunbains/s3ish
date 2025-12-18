@@ -20,7 +20,7 @@ use crate::storage::StorageError;
 use axum::{
     body::Body,
     extract::{OriginalUri, Path, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, HeaderName, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -36,16 +36,17 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
+use tokio::io::{AsyncSeekExt, AsyncReadExt};
+use tokio_util::io::ReaderStream;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// AWS SigV4 encoding: leave unreserved + slash unencoded.
+// AWS SigV4 encoding: leave unreserved characters unescaped.
 const AWS_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
-    .remove(b'~')
-    .remove(b'/');
+    .remove(b'~');
 
 /// S3 HTTP handler wrapping BaseHandler
 #[derive(Clone)]
@@ -958,6 +959,33 @@ fn normalize_header_value(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn multipart_part_count_from_etag(etag: &str) -> Option<u32> {
+    let trimmed = etag.trim_matches('"');
+    let idx = trimmed.rfind('-')?;
+    trimmed[idx + 1..].parse().ok()
+}
+
+fn part_range_from_meta(
+    meta: &crate::storage::ObjectMetadata,
+    part_number: u32,
+) -> Result<(u64, u64, u32), S3Error> {
+    if part_number == 0 {
+        return Err(S3Error::InvalidPart("invalid part number".into()));
+    }
+    let part_count =
+        multipart_part_count_from_etag(&meta.etag).ok_or_else(|| S3Error::InvalidPart("partNumber requires multipart object".into()))?;
+    let part_size = (meta.size + part_count as u64 - 1) / part_count as u64;
+    if part_size == 0 {
+        return Err(S3Error::InvalidPart("invalid part number".into()));
+    }
+    let start = (part_number as u64 - 1).saturating_mul(part_size);
+    if start >= meta.size {
+        return Err(S3Error::InvalidPart("invalid part number".into()));
+    }
+    let end = (start + part_size - 1).min(meta.size.saturating_sub(1));
+    Ok((start, end, part_count))
+}
+
 fn canonical_uri(path: &str) -> String {
     if path == "/" || path.is_empty() {
         return "/".to_string();
@@ -1062,8 +1090,16 @@ fn canonical_query(uri: &Uri) -> String {
         .map(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             (
-                utf8_percent_encode(name, AWS_ENCODE_SET).to_string(),
-                utf8_percent_encode(value, AWS_ENCODE_SET).to_string(),
+                utf8_percent_encode(
+                    &percent_encoding::percent_decode_str(name).decode_utf8_lossy(),
+                    AWS_ENCODE_SET,
+                )
+                .to_string(),
+                utf8_percent_encode(
+                    &percent_encoding::percent_decode_str(value).decode_utf8_lossy(),
+                    AWS_ENCODE_SET,
+                )
+                .to_string(),
             )
         })
         .collect();
@@ -1100,8 +1136,16 @@ fn canonical_query_presigned(uri: &Uri) -> String {
                 None
             } else {
                 Some((
-                    utf8_percent_encode(name, AWS_ENCODE_SET).to_string(),
-                    utf8_percent_encode(value, AWS_ENCODE_SET).to_string(),
+                    utf8_percent_encode(
+                        &percent_encoding::percent_decode_str(name).decode_utf8_lossy(),
+                        AWS_ENCODE_SET,
+                    )
+                    .to_string(),
+                    utf8_percent_encode(
+                        &percent_encoding::percent_decode_str(value).decode_utf8_lossy(),
+                        AWS_ENCODE_SET,
+                    )
+                    .to_string(),
                 ))
             }
         })
@@ -2292,7 +2336,7 @@ async fn post_object(
 async fn get_object(
     State(state): State<S3State>,
     Path((path_bucket, path_key)): Path<(String, String)>,
-    Query(params): Query<ObjectVersionParams>,
+    Query(params): Query<GetObjectQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, S3Error> {
@@ -2322,6 +2366,115 @@ async fn get_object(
     s3_handler
         .check_bucket_policy(&bucket, Some(&key), "s3:GetObject", &headers, &uri)
         .await?;
+
+    let part_number = params.part_number;
+
+    // Try zero-copy/streaming path first (sendfile-compatible).
+    if params.version_id.is_none() {
+        if let Some(sf) = state.handler.storage.open_for_sendfile(&bucket, &key).await {
+            let sf = sf?;
+            let mut file = tokio::fs::File::open(&sf.path)
+                .await
+                .map_err(|_| S3Error::ObjectNotFound { bucket: bucket.clone(), key: key.clone() })?;
+            let meta = sf.metadata.clone();
+
+            if let Some(part_no) = part_number {
+                let (start, end_inclusive, part_count) = part_range_from_meta(&meta, part_no)?;
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|_| S3Error::InvalidPart("invalid part number".into()))?;
+                let take_len = end_inclusive - start + 1;
+                let stream = ReaderStream::with_capacity(file.take(take_len), 64 * 1024);
+                let body = Body::from_stream(stream);
+                let mut resp: Response = (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_TYPE, meta.content_type.clone()),
+                        (header::ETAG, format!("\"{}\"", meta.etag)),
+                        (header::CONTENT_LENGTH, take_len.to_string()),
+                        (
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end_inclusive, meta.size),
+                        ),
+                        (header::ACCEPT_RANGES, "bytes".to_string()),
+                        (
+                            HeaderName::from_static("x-amz-mp-parts-count"),
+                            part_count.to_string(),
+                        ),
+                        (
+                            header::LAST_MODIFIED,
+                            format_http_date(meta.last_modified_unix_secs),
+                        ),
+                    ],
+                    body,
+                )
+                    .into_response();
+                apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+                apply_storage_headers(resp.headers_mut(), &meta);
+                return Ok(attach_common_headers(resp, &state));
+            }
+
+            if let Some(range_header) = headers.get(header::RANGE) {
+                let range_str = range_header
+                    .to_str()
+                    .map_err(|_| S3Error::InvalidRange(meta.size))?;
+                let (start, end) = parse_range(range_str, meta.size)?;
+                let end_inclusive = end.min(meta.size.saturating_sub(1));
+                if start > end_inclusive {
+                    return Err(S3Error::InvalidRange(meta.size));
+                }
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(|_| S3Error::InvalidRange(meta.size))?;
+                let take_len = end_inclusive - start + 1;
+                let stream = ReaderStream::with_capacity(file.take(take_len), 64 * 1024);
+                let body = Body::from_stream(stream);
+                let mut resp: Response = (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_TYPE, meta.content_type.clone()),
+                        (header::ETAG, format!("\"{}\"", meta.etag)),
+                        (header::CONTENT_LENGTH, take_len.to_string()),
+                        (
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end_inclusive, meta.size),
+                        ),
+                        (header::ACCEPT_RANGES, "bytes".to_string()),
+                        (
+                            header::LAST_MODIFIED,
+                            format_http_date(meta.last_modified_unix_secs),
+                        ),
+                    ],
+                    body,
+                )
+                    .into_response();
+                apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+                apply_storage_headers(resp.headers_mut(), &meta);
+                return Ok(attach_common_headers(resp, &state));
+            }
+
+            let stream = ReaderStream::with_capacity(file, 64 * 1024);
+            let body = Body::from_stream(stream);
+            let mut resp: Response = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, meta.content_type.clone()),
+                    (header::ETAG, format!("\"{}\"", meta.etag)),
+                    (header::CONTENT_LENGTH, meta.size.to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (
+                        header::LAST_MODIFIED,
+                        format_http_date(meta.last_modified_unix_secs),
+                    ),
+                ],
+                body,
+            )
+                .into_response();
+            apply_metadata_headers(resp.headers_mut(), &meta.metadata);
+            apply_storage_headers(resp.headers_mut(), &meta);
+            return Ok(attach_common_headers(resp, &state));
+        }
+    }
 
     let (data, meta) = if let Some(version_id) = params.version_id {
         state.handler.storage.get_object_version(&bucket, &key, &version_id).await?
@@ -2387,7 +2540,40 @@ async fn get_object(
         return Ok(attach_common_headers(resp, &state));
     }
 
-    let mut resp: Response = (
+    let mut resp: Response = if let Some(part_no) = part_number {
+        let (start, end_inclusive, part_count) = part_range_from_meta(&meta, part_no)?;
+        let take_len = end_inclusive - start + 1;
+        let start_usize = start as usize;
+        let end_usize = end_inclusive as usize;
+        if end_usize >= data.len() {
+            return Err(S3Error::InvalidPart("invalid part number".into()));
+        }
+        let slice = data.slice(start_usize..=end_usize);
+        (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, meta.content_type.clone()),
+                (header::ETAG, format!("\"{}\"", meta.etag)),
+                (header::CONTENT_LENGTH, take_len.to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end_inclusive, meta.size),
+                ),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (
+                    HeaderName::from_static("x-amz-mp-parts-count"),
+                    part_count.to_string(),
+                ),
+                (
+                    header::LAST_MODIFIED,
+                    format_http_date(meta.last_modified_unix_secs),
+                ),
+            ],
+            Body::from(slice),
+        )
+            .into_response()
+    } else {
+        (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, meta.content_type.clone()),
@@ -2401,6 +2587,8 @@ async fn get_object(
         ],
         Body::from(data),
     )
+            .into_response()
+    }
         .into_response();
     apply_metadata_headers(resp.headers_mut(), &meta.metadata);
     apply_storage_headers(resp.headers_mut(), &meta);
@@ -2627,6 +2815,14 @@ struct ListObjectsParams {
 struct ObjectVersionParams {
     #[serde(rename = "versionId")]
     version_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct GetObjectQuery {
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
+    #[serde(rename = "partNumber")]
+    part_number: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]

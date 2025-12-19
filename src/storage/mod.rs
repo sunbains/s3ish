@@ -96,6 +96,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         metadata: HashMap<String, String>,
         storage_class: Option<String>,
         server_side_encryption: Option<String>,
+        etag: Option<String>, // Pre-computed ETag to avoid recomputation
     ) -> Result<ObjectMetadata, StorageError>;
 
     async fn get_object(

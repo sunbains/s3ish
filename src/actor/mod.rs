@@ -20,11 +20,13 @@
 //! messages sequentially, avoiding lock contention entirely.
 
 pub mod backend;
+pub mod compio_io;
 pub mod fs_store;
 pub mod messages;
 pub mod metrics;
 
 pub use backend::ActorStorageBackend;
+pub use compio_io::CompioIoService;
 pub use fs_store::{FsStoreActor, FsStoreReader};
 pub use messages::{FsCommand, ObjectHeaders};
 pub use metrics::Metrics;

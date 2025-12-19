@@ -403,6 +403,7 @@ impl StorageBackend for InMemoryStorage {
         metadata: HashMap<String, String>,
         storage_class: Option<String>,
         server_side_encryption: Option<String>,
+        etag: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
         let start_time = std::time::Instant::now();
 
@@ -426,7 +427,7 @@ impl StorageBackend for InMemoryStorage {
         }
 
         let size = data.len() as u64;
-        let etag = compute_etag(&data);
+        let etag = etag.unwrap_or_else(|| compute_etag(&data));
         // InMemory storage doesn't need erasure coding - just store data as-is
         // Erasure coding is for disk failure protection, not needed for RAM
         let shards = vec![data];  // No clone - transfer ownership
@@ -829,6 +830,7 @@ impl StorageBackend for InMemoryStorage {
                 HashMap::new(),
                 None,
                 None,
+                None, // etag will be computed during put
             )
             .await?;
 

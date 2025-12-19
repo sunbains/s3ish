@@ -900,6 +900,7 @@ impl StorageBackend for FileStorage {
         metadata: HashMap<String, String>,
         storage_class: Option<String>,
         server_side_encryption: Option<String>,
+        etag: Option<String>,
     ) -> Result<ObjectMetadata, StorageError> {
         let start_time = std::time::Instant::now();
 
@@ -1182,9 +1183,9 @@ impl StorageBackend for FileStorage {
         }
 
         let size = data.len() as u64;
-        // Use the incrementally computed BLAKE3 hash (computed during erasure coding loop)
+        // Use pre-computed ETag if provided (from HTTP layer), otherwise use incrementally computed hash
         // BLAKE3 produces 256-bit hashes vs MD5's 128-bit, providing better collision resistance
-        let etag = hasher.finalize().to_hex().to_string();
+        let etag = etag.unwrap_or_else(|| hasher.finalize().to_hex().to_string());
         let stored_meta = StoredMeta {
             content_type: content_type.to_string(),
             etag: etag.clone(),
@@ -1824,6 +1825,7 @@ impl StorageBackend for FileStorage {
                 HashMap::new(),
                 None,
                 None,
+                None, // etag will be computed during put
             )
             .await?;
 

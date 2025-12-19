@@ -14,14 +14,14 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 use clap::Parser;
-use s3ish::actor::{ActorStorageBackend, FsStoreActor, FsStoreReader, Metrics as ActorMetrics};
+use s3ish::actor::{ActorStorageBackend, CompioIoService, FsStoreActor, FsStoreReader, Metrics as ActorMetrics};
 use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
 use s3ish::config::Config;
 use s3ish::handler::BaseHandler;
 use s3ish::observability::tracing_setup;
 use s3ish::s3_http::ResponseContext;
-use s3ish::server::{ConnectionManager, GrpcConnectionManager, S3HttpConnectionManager};
+use s3ish::server::{ConnectionManager, GrpcConnectionManager, QuicConnectionManager, S3HttpConnectionManager, TcpConnectionManager, QuinnConnectionManager};
 use s3ish::storage::in_memory::InMemoryStorage;
 use s3ish::storage::StorageBackend;
 use std::net::SocketAddr;
@@ -47,9 +47,13 @@ struct Args {
     /// Path to credentials file
     #[arg(short, long)]
     auth_file: Option<String>,
+
+    /// Benchmark mode: skip storage writes for maximum throughput testing
+    #[arg(long, default_value = "false")]
+    benchmark_mode: bool,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing with format from environment
     tracing_setup::init_tracing_from_env();
@@ -59,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config from file
     let cfg = Config::from_path(&args.config)?;
 
+    tracing::info!(
+        "Runtime initialized with 32 worker threads"
+    );
     // Command line args override config file
     let addr: SocketAddr = args.listen.as_ref().unwrap_or(&cfg.listen_addr).parse()?;
 
@@ -81,6 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| s.into())
                 .collect();
 
+            // Create compio I/O service with one runtime per disk
+            let io_service = CompioIoService::new(drives.len());
+            tracing::info!("CompioIoService initialized with {} runtimes (one per disk)", drives.len());
+
             // Create shared reader for direct GET access (bypasses actor overhead)
             let shared_metrics = Arc::new(ActorMetrics::new());
             let reader = FsStoreReader::new(
@@ -89,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.storage.erasure.data_blocks,
                 cfg.storage.erasure.parity_blocks,
                 shared_metrics.clone(),
+                io_service.clone(),
             );
 
             for i in 0..num_actors {
@@ -102,6 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cfg.storage.erasure.parity_blocks,
                     fs_rx,
                     actor_metrics.clone(),
+                    io_service.clone(),
+                    cfg.storage.io.consistency,
                 );
 
                 tokio::spawn(actor.run());
@@ -155,6 +169,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let server = S3HttpConnectionManager::new(handler, response_ctx);
             tracing::info!("s3ish HTTP server listening on {}", addr);
             tracing::info!("auth via headers: x-access-key / x-secret-key (or x-amz-*)");
+
+            tokio::select! {
+                r = server.serve(addr) => {
+                    if let Err(e) = r {
+                        tracing::error!("server exited with error: {e}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("ctrl-c received, shutting down");
+                }
+            }
+        }
+        "quic" => {
+            let server = QuicConnectionManager::new(handler, response_ctx, args.benchmark_mode)?;
+            tracing::info!("s3ish QUIC server listening on {}", addr);
+            tracing::info!("protocol: custom file transfer over QUIC");
+            if args.benchmark_mode {
+                tracing::warn!("BENCHMARK MODE ENABLED: Storage writes disabled");
+            }
+
+            tokio::select! {
+                r = server.serve(addr) => {
+                    if let Err(e) = r {
+                        tracing::error!("server exited with error: {e}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("ctrl-c received, shutting down");
+                }
+            }
+        }
+        "tcp" => {
+            let server = TcpConnectionManager::new(handler);
+            tracing::info!("s3ish TCP sendfile server listening on {}", addr);
+            tracing::info!("protocol: TCP with sendfile() zero-copy transfers");
+
+            tokio::select! {
+                r = server.serve(addr) => {
+                    if let Err(e) = r {
+                        tracing::error!("server exited with error: {e}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("ctrl-c received, shutting down");
+                }
+            }
+        }
+        "quinn" | "quinn-noenc" => {
+            let no_encryption = protocol == "quinn-noenc";
+            let server = QuinnConnectionManager::new(handler, args.benchmark_mode, no_encryption);
+            tracing::info!("s3ish Quinn QUIC server listening on {}", addr);
+            tracing::info!(
+                "protocol: Quinn QUIC (encryption: {})",
+                if no_encryption { "DISABLED" } else { "enabled" }
+            );
+            if args.benchmark_mode {
+                tracing::warn!("BENCHMARK MODE ENABLED: Storage writes disabled");
+            }
 
             tokio::select! {
                 r = server.serve(addr) => {

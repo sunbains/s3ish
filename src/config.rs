@@ -39,6 +39,9 @@ pub struct Config {
 
     #[serde(default)]
     pub test: TestConfig,
+
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -158,6 +161,23 @@ pub struct CacheConfig {
     pub flush_threshold_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConsistencyLevel {
+    /// Eventual consistency: metadata written immediately, data writes happen asynchronously
+    /// Fastest - minimal latency, but metadata may appear before data is fully written
+    Eventual,
+    /// Strong consistency: metadata written only after all data writes complete via io_uring links
+    /// Slower but guarantees metadata is never visible before data is written
+    Strong,
+}
+
+impl Default for ConsistencyLevel {
+    fn default() -> Self {
+        ConsistencyLevel::Eventual
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct IoConfig {
     /// Buffer size for writes in bytes (larger = fewer syscalls, more memory)
@@ -166,6 +186,11 @@ pub struct IoConfig {
     /// Buffer size for reads in bytes (larger = fewer syscalls, more memory)
     #[serde(default = "default_read_buffer_size")]
     pub read_buffer_size: usize,
+    /// Consistency level for write operations
+    /// - eventual (default): minimal latency, metadata written immediately
+    /// - strong: guaranteed consistency, metadata written after data via io_uring links
+    #[serde(default)]
+    pub consistency: ConsistencyLevel,
 }
 
 impl Default for CacheConfig {
@@ -183,6 +208,7 @@ impl Default for IoConfig {
         Self {
             write_buffer_size: default_write_buffer_size(),
             read_buffer_size: default_read_buffer_size(),
+            consistency: ConsistencyLevel::default(),
         }
     }
 }
@@ -332,4 +358,36 @@ fn default_test_duration_secs() -> u64 {
 
 fn default_test_object_size() -> usize {
     1024 * 1024 // 1 MB
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeConfig {
+    /// Number of worker threads for the HTTP/gRPC front-end runtime
+    /// Handles incoming requests, parsing, authentication
+    /// Recommended: 8-16 for most workloads, 32+ for high connection count
+    #[serde(default = "default_frontend_threads")]
+    pub frontend_threads: usize,
+
+    /// Number of worker threads for the I/O runtime
+    /// Handles disk I/O, storage operations, and heavy processing
+    /// Recommended: 16-32 for most workloads, 64+ for high IOPS
+    #[serde(default = "default_io_threads")]
+    pub io_threads: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            frontend_threads: default_frontend_threads(),
+            io_threads: default_io_threads(),
+        }
+    }
+}
+
+fn default_frontend_threads() -> usize {
+    16
+}
+
+fn default_io_threads() -> usize {
+    16
 }

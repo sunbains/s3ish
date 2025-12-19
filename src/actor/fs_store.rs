@@ -184,10 +184,13 @@ pub struct FsStoreReader {
     /// Metadata cache - keep metadata in memory to avoid disk reads
     /// DashMap eliminates all lock contention for cache hits
     metadata_cache: Arc<DashMap<(String, String), Arc<CachedMetadata>>>,
+
+    /// Compio I/O service (one runtime per disk)
+    io_service: crate::actor::CompioIoService,
 }
 
 impl FsStoreReader {
-    pub fn new(drives: Vec<PathBuf>, erasure_enabled: bool, data_blocks: usize, parity_blocks: usize, metrics: Arc<Metrics>) -> Self {
+    pub fn new(drives: Vec<PathBuf>, erasure_enabled: bool, data_blocks: usize, parity_blocks: usize, metrics: Arc<Metrics>, io_service: crate::actor::CompioIoService) -> Self {
         let erasure = Erasure::new(data_blocks, parity_blocks, ERASURE_CHUNK_SIZE)
             .expect("Failed to create erasure coding");
 
@@ -198,6 +201,7 @@ impl FsStoreReader {
             metrics,
             fd_cache: Arc::new(DashMap::with_capacity(FD_CACHE_SIZE)),
             metadata_cache: Arc::new(DashMap::with_capacity(METADATA_CACHE_SIZE)),
+            io_service,
         }
     }
 
@@ -278,6 +282,16 @@ impl FsStoreReader {
     fn drive_for_shard(&self, shard_index: usize) -> &Path {
         let drive_index = shard_index % self.drives.len();
         &self.drives[drive_index]
+    }
+
+    fn disk_for_key(&self, bucket: &str, key: &str) -> usize {
+        // Hash bucket+key to determine disk (distributes single files across all disks)
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        bucket.hash(&mut hasher);
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % self.drives.len()
     }
 
     // Path helper methods
@@ -567,35 +581,10 @@ impl FsStoreReader {
 
             let read_start = std::time::Instant::now();
 
-            // Read chunk with caching
-            let chunk_data = match self.get_or_open_file(&shard_path).await {
-                Ok(arc_file) => {
-                    // Clone the file handle and read its contents
-                    match arc_file.as_ref().try_clone().await {
-                        Ok(mut f) => {
-                            // Reset file position
-                            use tokio::io::AsyncSeekExt;
-                            if let Err(e) = f.seek(std::io::SeekFrom::Start(0)).await {
-                                return Err(StorageError::Internal(format!("seek chunk {}: {}", idx, e)));
-                            }
-
-                            // Read entire chunk
-                            use tokio::io::AsyncReadExt;
-                            let mut data = Vec::new();
-                            if let Err(e) = f.read_to_end(&mut data).await {
-                                return Err(StorageError::Internal(format!("read chunk {}: {}", idx, e)));
-                            }
-                            data
-                        }
-                        Err(e) => {
-                            return Err(StorageError::Internal(format!("clone file handle for chunk {}: {}", idx, e)));
-                        }
-                    }
-                }
-                Err(_) => {
-                    return Err(StorageError::Internal(format!("chunk {} not found", idx)));
-                }
-            };
+            // Read chunk using compio (io_uring)
+            let disk_id = idx % self.drives.len();
+            let chunk_data = self.io_service.read(disk_id, &shard_path).await
+                .map_err(|e| StorageError::Internal(format!("read chunk {}: {}", idx, e)))?;
 
             prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
             prom_metrics::increment_disk_shard_ops("read", &drive_name);
@@ -607,6 +596,39 @@ impl FsStoreReader {
         out.truncate(size as usize);
 
         Ok(out)
+    }
+
+    /// Open object for sendfile (zero-copy streaming)
+    /// Returns Some if object is stored as single file, None for striped/erasure coded
+    pub async fn open_for_sendfile(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<Result<crate::storage::SendfileObject, StorageError>> {
+        use crate::storage::SendfileObject;
+
+        let obj_path = self.object_path(bucket, key);
+        let meta_path = self.meta_path(&obj_path);
+
+        // Get cached metadata
+        let stored = match self.get_metadata(bucket, key, &meta_path).await {
+            Ok(s) => s,
+            Err(_) => return Some(Err(StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })),
+        };
+
+        // Only use sendfile for single-file storage (not striped/erasure coded)
+        if stored.data_blocks.is_some() || stored.parity_blocks.is_some() {
+            return None; // Fall back to regular path for striped storage
+        }
+
+        // Return file path for direct streaming
+        Some(Ok(SendfileObject {
+            path: obj_path,
+            metadata: to_object_metadata(stored),
+        }))
     }
 }
 
@@ -623,6 +645,9 @@ pub struct FsStoreActor {
 
     /// Cache of created directories (optimization)
     created_dirs: std::collections::HashSet<PathBuf>,
+
+    /// Consistency level for write operations
+    consistency: crate::config::ConsistencyLevel,
 }
 
 impl FsStoreActor {
@@ -634,15 +659,18 @@ impl FsStoreActor {
         parity_blocks: usize,
         rx: mpsc::Receiver<FsCommand>,
         metrics: Arc<Metrics>,
+        io_service: crate::actor::CompioIoService,
+        consistency: crate::config::ConsistencyLevel,
     ) -> Self {
         assert!(!drives.is_empty(), "At least one drive required");
 
-        let reader = FsStoreReader::new(drives, erasure_enabled, data_blocks, parity_blocks, metrics);
+        let reader = FsStoreReader::new(drives, erasure_enabled, data_blocks, parity_blocks, metrics, io_service);
 
         Self {
             reader,
             rx,
             created_dirs: std::collections::HashSet::new(),
+            consistency,
         }
     }
 
@@ -836,6 +864,8 @@ impl FsStoreActor {
         data: Bytes,
         headers: crate::actor::messages::ObjectHeaders,
     ) -> Result<ObjectMetadata, StorageError> {
+        let start_handle = std::time::Instant::now();
+
         validate_bucket(bucket)?;
         validate_key(key)?;
         if headers.content_type.is_empty() {
@@ -845,12 +875,15 @@ impl FsStoreActor {
         }
 
         // Check bucket exists
+        let start_bucket_check = std::time::Instant::now();
         let bucket_path = self.bucket_path(bucket);
         if fs::metadata(&bucket_path).await.is_err() {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
+        let bucket_check_elapsed = start_bucket_check.elapsed();
 
         // Get object paths (metadata goes on primary drive)
+        let start_mkdir = std::time::Instant::now();
         let obj_path = self.object_path(bucket, key);
         if let Some(parent) = obj_path.parent() {
             // Use directory cache to avoid redundant create_dir_all() calls
@@ -861,9 +894,16 @@ impl FsStoreActor {
                 self.created_dirs.insert(parent.to_path_buf());
             }
         }
+        let mkdir_elapsed = start_mkdir.elapsed();
 
         let meta_path = self.meta_path(&obj_path);
         let size = data.len() as u64;
+
+        tracing::info!(
+            "Actor handle_put_object: bucket_check={:.2}ms, mkdir={:.2}ms",
+            bucket_check_elapsed.as_secs_f64() * 1000.0,
+            mkdir_elapsed.as_secs_f64() * 1000.0
+        );
 
         // Fast path: store inline without erasure coding if:
         // 1. Erasure coding is disabled, OR
@@ -999,11 +1039,14 @@ impl FsStoreActor {
         };
 
         // Write metadata
-        let meta_bytes =
-            serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
-        fs::write(&meta_path, meta_bytes)
-            .await
-            .map_err(|e| StorageError::Internal(format!("write meta: {}", e)))?;
+        let meta_bytes = Bytes::from(
+            serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?
+        );
+        let io_service = self.reader.io_service.clone();
+        let meta_path_clone = meta_path.clone();
+        tokio::spawn(async move {
+            let _ = io_service.write(0, &meta_path_clone, meta_bytes).await;
+        });
 
         // Update metrics
         self.reader.metrics.inc_put();
@@ -1023,8 +1066,12 @@ impl FsStoreActor {
         meta_path: PathBuf,
         size: u64,
     ) -> Result<ObjectMetadata, StorageError> {
+        let start_inline = std::time::Instant::now();
+
         // Compute hash
+        let start_hash = std::time::Instant::now();
         let etag = blake3::hash(&data).to_hex().to_string();
+        let hash_elapsed = start_hash.elapsed();
 
         // OPTIMIZATION: Stripe across multiple drives for parallel I/O
         // Even without erasure coding, we split the object into chunks and write to different drives
@@ -1034,79 +1081,212 @@ impl FsStoreActor {
         if is_striped {
             // Multi-drive striping: split into equal chunks
             let chunk_size = data.len().div_ceil(num_drives);
-            let shard_dir = self.shard_dir(bucket, key);
+            let _shard_dir = self.shard_dir(bucket, key);
 
-            // Create shard directory
-            fs::create_dir_all(&shard_dir)
-                .await
-                .map_err(|e| StorageError::Internal(format!("create shard dir: {}", e)))?;
-
-            // Write chunks to different drives in parallel (well, sequentially for now)
-            for (idx, chunk) in data.chunks(chunk_size).enumerate() {
+            // Create all shard directories FIRST
+            let start_mkdir = std::time::Instant::now();
+            for idx in 0..num_drives {
                 let drive = self.drive_for_shard(idx);
-                let drive_name = drive.display().to_string();
                 let shard_dir_on_drive = self.shard_dir_on_drive(drive, bucket, key);
-                let shard_path = shard_dir_on_drive.join(format!("{}", idx));
-
-                // Create parent dirs if needed
-                if let Some(parent) = shard_path.parent() {
-                    fs::create_dir_all(parent).await.ok();
-                }
-
-                let write_start = std::time::Instant::now();
-                fs::write(&shard_path, chunk)
+                fs::create_dir_all(&shard_dir_on_drive)
                     .await
-                    .map_err(|e| StorageError::Internal(format!("write striped chunk {}: {}", idx, e)))?;
+                    .map_err(|e| StorageError::Internal(format!("create shard dir: {}", e)))?;
+            }
+            let mkdir_elapsed = start_mkdir.elapsed();
 
-                prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
-                prom_metrics::increment_disk_shard_ops("write", &drive_name);
+            // Create metadata
+            let (data_blocks, parity_blocks, block_size) = {
+                let chunk_size = data.len().div_ceil(num_drives);
+                let num_chunks = data.len().div_ceil(chunk_size);
+                (Some(num_chunks), Some(0), Some(chunk_size))
+            };
+
+            let stored_meta = StoredMeta {
+                content_type: headers.content_type.clone(),
+                etag: etag.clone(),
+                size,
+                last_modified_unix_secs: Utc::now().timestamp(),
+                metadata: headers.metadata.clone(),
+                data_blocks,
+                parity_blocks,
+                block_size,
+                storage_class: headers.storage_class.clone(),
+                server_side_encryption: headers.server_side_encryption.clone(),
+                version_id: None,
+                is_latest: true,
+                is_delete_marker: false,
+            };
+
+            match self.consistency {
+                crate::config::ConsistencyLevel::Eventual => {
+                    // EVENTUAL CONSISTENCY: Fire-and-forget - submit all writes immediately
+                    // Data and metadata writes happen asynchronously in io_uring
+                    // No spawning, no waiting - just submit to compio and return
+
+                    // Submit all chunk writes to compio (fire-and-forget)
+                    let start_writes = std::time::Instant::now();
+                    for (idx, chunk) in data.chunks(chunk_size).enumerate() {
+                        let drive = self.drive_for_shard(idx);
+                        let shard_dir_on_drive = self.shard_dir_on_drive(drive, bucket, key);
+                        let shard_path = shard_dir_on_drive.join(format!("{}", idx));
+                        let chunk_data = Bytes::copy_from_slice(chunk);
+                        let disk_id = idx % self.reader.drives.len();
+
+                        // Fire-and-forget: submit write to io_uring
+                        let _ = self.reader.io_service.write_nowait(disk_id, shard_path, chunk_data);
+                    }
+
+                    // Write metadata immediately (fire-and-forget)
+                    let meta_bytes = Bytes::from(serde_json::to_vec(&stored_meta)
+                        .map_err(|e| StorageError::Internal(e.to_string()))?);
+                    let _ = self.reader.io_service.write_nowait(0, meta_path.clone(), meta_bytes);
+                    let writes_elapsed = start_writes.elapsed();
+
+                    let inline_elapsed = start_inline.elapsed();
+                    tracing::info!(
+                        "inline_striped: total={:.2}ms, hash={:.2}ms, mkdir={:.2}ms, writes={:.2}ms, chunks={}",
+                        inline_elapsed.as_secs_f64() * 1000.0,
+                        hash_elapsed.as_secs_f64() * 1000.0,
+                        mkdir_elapsed.as_secs_f64() * 1000.0,
+                        writes_elapsed.as_secs_f64() * 1000.0,
+                        num_drives
+                    );
+                }
+                crate::config::ConsistencyLevel::Strong => {
+                    // STRONG CONSISTENCY: Ensure metadata written after data completes
+                    // TODO: Use io_uring linked operations for zero-overhead coordination
+                    // For now, use the spawn-based coordination (will be replaced)
+
+                    let mut write_futures = Vec::new();
+                    for (idx, chunk) in data.chunks(chunk_size).enumerate() {
+                        let drive = self.drive_for_shard(idx);
+                        let drive_name = drive.display().to_string();
+                        let shard_dir_on_drive = self.shard_dir_on_drive(drive, bucket, key);
+                        let shard_path = shard_dir_on_drive.join(format!("{}", idx));
+                        let chunk_data = Bytes::copy_from_slice(chunk);
+                        let disk_id = idx % self.reader.drives.len();
+                        let io_service = self.reader.io_service.clone();
+
+                        let write_future = tokio::spawn(async move {
+                            let write_start = std::time::Instant::now();
+                            let result = io_service.write(disk_id, &shard_path, chunk_data).await
+                                .map_err(|e| StorageError::Internal(format!("write striped chunk {}: {}", idx, e)));
+                            let elapsed = write_start.elapsed().as_secs_f64();
+                            (result, drive_name, elapsed)
+                        });
+                        write_futures.push(write_future);
+                    }
+
+                    let meta_bytes = Bytes::from(serde_json::to_vec(&stored_meta)
+                        .map_err(|e| StorageError::Internal(e.to_string()))?);
+                    let io_service = self.reader.io_service.clone();
+                    let meta_path_clone = meta_path.clone();
+
+                    tokio::spawn(async move {
+                        for future in write_futures {
+                            if let Ok((result, drive_name, elapsed)) = future.await {
+                                if result.is_ok() {
+                                    prom_metrics::record_disk_shard_write(&drive_name, elapsed);
+                                    prom_metrics::increment_disk_shard_ops("write", &drive_name);
+                                }
+                            }
+                        }
+                        let _ = io_service.write(0, &meta_path_clone, meta_bytes).await;
+                    });
+                }
             }
         } else {
-            // Single drive or small object: write to one file
-            let write_start = std::time::Instant::now();
-            fs::write(&obj_path, &data)
-                .await
-                .map_err(|e| StorageError::Internal(format!("write inline object: {}", e)))?;
+            // Single drive: write data, then metadata
+            let (data_blocks, parity_blocks, block_size) = (None, None, None);
 
-            let drive = self.primary_drive();
-            let drive_name = drive.display().to_string();
-            prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
-            prom_metrics::increment_disk_shard_ops("write", &drive_name);
+            let stored_meta = StoredMeta {
+                content_type: headers.content_type.clone(),
+                etag: etag.clone(),
+                size,
+                last_modified_unix_secs: Utc::now().timestamp(),
+                metadata: headers.metadata.clone(),
+                data_blocks,
+                parity_blocks,
+                block_size,
+                storage_class: headers.storage_class.clone(),
+                server_side_encryption: headers.server_side_encryption.clone(),
+                version_id: None,
+                is_latest: true,
+                is_delete_marker: false,
+            };
+
+            let meta_bytes = Bytes::from(serde_json::to_vec(&stored_meta)
+                .map_err(|e| StorageError::Internal(e.to_string()))?);
+
+            match self.consistency {
+                crate::config::ConsistencyLevel::Eventual => {
+                    // EVENTUAL CONSISTENCY: Fire-and-forget both writes
+                    let data_clone = data.clone();  // Bytes::clone is cheap (just Arc clone)
+
+                    // Submit data write to io_uring (fire-and-forget)
+                    let _ = self.reader.io_service.write_nowait(0, obj_path.clone(), data_clone);
+
+                    // Submit metadata write to io_uring (fire-and-forget)
+                    let _ = self.reader.io_service.write_nowait(0, meta_path.clone(), meta_bytes);
+                }
+                crate::config::ConsistencyLevel::Strong => {
+                    // STRONG CONSISTENCY: metadata written after data completes
+                    // TODO: Use io_uring linked operations
+                    let io_service = self.reader.io_service.clone();
+                    let obj_path_clone = obj_path.clone();
+                    let data_clone = data.clone();
+                    let meta_path_clone = meta_path.clone();
+                    let drive = self.primary_drive();
+                    let drive_name = drive.display().to_string();
+
+                    tokio::spawn(async move {
+                        let write_start = std::time::Instant::now();
+                        if io_service.write(0, &obj_path_clone, data_clone).await.is_ok() {
+                            prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
+                            prom_metrics::increment_disk_shard_ops("write", &drive_name);
+                            let _ = io_service.write(0, &meta_path_clone, meta_bytes).await;
+                        }
+                    });
+                }
+            }
         }
 
-        // Create metadata
-        // For striped objects: data_blocks=num_chunks, parity_blocks=0 (no EC)
-        // For single file: data_blocks=None, parity_blocks=None
-        let (data_blocks, parity_blocks, block_size) = if is_striped {
+        // Return metadata immediately (writes happen in background)
+        let stored_meta = if is_striped {
             let chunk_size = data.len().div_ceil(num_drives);
             let num_chunks = data.len().div_ceil(chunk_size);
-            (Some(num_chunks), Some(0), Some(chunk_size))
+            StoredMeta {
+                content_type: headers.content_type,
+                etag: etag.clone(),
+                size,
+                last_modified_unix_secs: Utc::now().timestamp(),
+                metadata: headers.metadata,
+                data_blocks: Some(num_chunks),
+                parity_blocks: Some(0),
+                block_size: Some(chunk_size),
+                storage_class: headers.storage_class,
+                server_side_encryption: headers.server_side_encryption,
+                version_id: None,
+                is_latest: true,
+                is_delete_marker: false,
+            }
         } else {
-            (None, None, None)
+            StoredMeta {
+                content_type: headers.content_type,
+                etag: etag.clone(),
+                size,
+                last_modified_unix_secs: Utc::now().timestamp(),
+                metadata: headers.metadata,
+                data_blocks: None,
+                parity_blocks: None,
+                block_size: None,
+                storage_class: headers.storage_class,
+                server_side_encryption: headers.server_side_encryption,
+                version_id: None,
+                is_latest: true,
+                is_delete_marker: false,
+            }
         };
-
-        let stored_meta = StoredMeta {
-            content_type: headers.content_type,
-            etag: etag.clone(),
-            size,
-            last_modified_unix_secs: Utc::now().timestamp(),
-            metadata: headers.metadata,
-            data_blocks,
-            parity_blocks,
-            block_size,
-            storage_class: headers.storage_class,
-            server_side_encryption: headers.server_side_encryption,
-            version_id: None,
-            is_latest: true,
-            is_delete_marker: false,
-        };
-
-        // Write metadata
-        let meta_bytes =
-            serde_json::to_vec(&stored_meta).map_err(|e| StorageError::Internal(e.to_string()))?;
-        fs::write(&meta_path, meta_bytes)
-            .await
-            .map_err(|e| StorageError::Internal(format!("write meta: {}", e)))?;
 
         // Update metrics
         self.reader.metrics.inc_put();

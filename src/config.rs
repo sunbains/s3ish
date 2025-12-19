@@ -115,6 +115,10 @@ fn default_checkpoint_interval_secs() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ErasureConfig {
+    /// Enable/disable erasure coding
+    /// When false, objects are stored as single files (faster but no redundancy)
+    #[serde(default = "default_erasure_enabled")]
+    pub enabled: bool,
     /// Number of data blocks (shards) per object
     #[serde(default = "default_data_blocks")]
     pub data_blocks: usize,
@@ -129,11 +133,16 @@ pub struct ErasureConfig {
 impl Default for ErasureConfig {
     fn default() -> Self {
         Self {
+            enabled: default_erasure_enabled(),
             data_blocks: default_data_blocks(),
             parity_blocks: default_parity_blocks(),
             block_size: default_block_size(),
         }
     }
+}
+
+fn default_erasure_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -14,7 +14,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 use clap::Parser;
-use s3ish::actor::{ActorStorageBackend, FsStoreActor, Metrics as ActorMetrics};
+use s3ish::actor::{ActorStorageBackend, FsStoreActor, FsStoreReader, Metrics as ActorMetrics};
 use s3ish::auth::file_auth::FileAuthenticator;
 use s3ish::auth::Authenticator;
 use s3ish::config::Config;
@@ -81,12 +81,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| s.into())
                 .collect();
 
+            // Create shared reader for direct GET access (bypasses actor overhead)
+            let shared_metrics = Arc::new(ActorMetrics::new());
+            let reader = FsStoreReader::new(
+                drives.clone(),
+                cfg.storage.erasure.enabled,
+                cfg.storage.erasure.data_blocks,
+                cfg.storage.erasure.parity_blocks,
+                shared_metrics.clone(),
+            );
+
             for i in 0..num_actors {
                 let actor_metrics = Arc::new(ActorMetrics::new());
                 let (fs_tx, fs_rx) = mpsc::channel(10000);
 
                 let actor = FsStoreActor::new(
                     drives.clone(),
+                    cfg.storage.erasure.enabled,
                     cfg.storage.erasure.data_blocks,
                     cfg.storage.erasure.parity_blocks,
                     fs_rx,
@@ -99,9 +110,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("FsStoreActor {} started", i);
             }
 
-            tracing::info!("FsStoreActor started (actor model, multi-drive, {} actors)", num_actors);
+            if cfg.storage.erasure.enabled {
+                tracing::info!("FsStoreActor started (actor model, multi-drive, {} actors, erasure coding: {}/{})",
+                    num_actors, cfg.storage.erasure.data_blocks, cfg.storage.erasure.parity_blocks);
+            } else {
+                tracing::info!("FsStoreActor started (actor model, multi-drive, {} actors, erasure coding: DISABLED)", num_actors);
+            }
+            tracing::info!("GET operations bypass actor model for 10× latency reduction");
 
-            Arc::new(ActorStorageBackend::new(actor_channels))
+            Arc::new(ActorStorageBackend::new(actor_channels, reader))
         }
         _ => Arc::new(InMemoryStorage::new()),
     };

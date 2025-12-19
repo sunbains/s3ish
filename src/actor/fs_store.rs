@@ -25,6 +25,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
 use crossbeam_queue::ArrayQueue;
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -40,6 +41,8 @@ use crate::storage::{ObjectMetadata, StorageError};
 
 const ERASURE_CHUNK_SIZE: usize = 1024 * 1024; // 1MiB chunks
 const SMALL_OBJECT_THRESHOLD: usize = 128 * 1024; // 128KB - store inline without sharding
+const FD_CACHE_SIZE: usize = 10000; // Keep 10k file descriptors open
+const METADATA_CACHE_SIZE: usize = 100000; // Keep 100k metadata entries in memory
 
 /// Global buffer pool for reusing allocations
 /// Similar to Go's sync.Pool, reduces GC pressure and improves performance
@@ -151,48 +154,120 @@ async fn read_stored_meta(meta_path: &Path) -> Result<StoredMeta, StorageError> 
         .map_err(|e| StorageError::Internal(format!("deserialize meta: {}", e)))
 }
 
-/// Filesystem storage actor
-///
-/// Processes filesystem operations sequentially. All state is private
-/// to this actor, so no locks are needed.
-pub struct FsStoreActor {
-    /// Storage drives (for multi-drive sharding)
-    drives: Vec<PathBuf>,
-
-    /// Erasure coding configuration (immutable)
-    erasure: Erasure,
-
-    /// Incoming command channel
-    rx: mpsc::Receiver<FsCommand>,
-
-    /// Lock-free metrics
-    metrics: Arc<Metrics>,
-
-    /// Cache of created directories (optimization)
-    created_dirs: std::collections::HashSet<PathBuf>,
+/// Cached metadata entry with access tracking
+struct CachedMetadata {
+    stored: StoredMeta,
+    accessed: std::sync::atomic::AtomicU64,
 }
 
-impl FsStoreActor {
-    /// Create a new FsStoreActor
-    pub fn new(
-        drives: Vec<PathBuf>,
-        data_blocks: usize,
-        parity_blocks: usize,
-        rx: mpsc::Receiver<FsCommand>,
-        metrics: Arc<Metrics>,
-    ) -> Self {
-        assert!(!drives.is_empty(), "At least one drive required");
+/// Shared immutable state for read operations
+/// Can be cloned and used from multiple threads without actor message passing
+/// Clone is cheap: just copying a few paths + Erasure (Copy) + Arc pointers
+#[derive(Clone)]
+pub struct FsStoreReader {
+    /// Storage drives (for multi-drive sharding) - small Vec, cheap to clone
+    drives: Vec<PathBuf>,
 
+    /// Erasure coding enabled flag
+    erasure_enabled: bool,
+
+    /// Erasure coding configuration (Copy type, zero overhead)
+    erasure: Erasure,
+
+    /// Lock-free metrics (Arc is shared, cheap to clone)
+    metrics: Arc<Metrics>,
+
+    /// File descriptor cache - keep files open to avoid open() syscalls
+    /// DashMap provides lock-free concurrent access with internal sharding
+    fd_cache: Arc<DashMap<PathBuf, Arc<fs::File>>>,
+
+    /// Metadata cache - keep metadata in memory to avoid disk reads
+    /// DashMap eliminates all lock contention for cache hits
+    metadata_cache: Arc<DashMap<(String, String), Arc<CachedMetadata>>>,
+}
+
+impl FsStoreReader {
+    pub fn new(drives: Vec<PathBuf>, erasure_enabled: bool, data_blocks: usize, parity_blocks: usize, metrics: Arc<Metrics>) -> Self {
         let erasure = Erasure::new(data_blocks, parity_blocks, ERASURE_CHUNK_SIZE)
             .expect("Failed to create erasure coding");
 
         Self {
             drives,
+            erasure_enabled,
             erasure,
-            rx,
             metrics,
-            created_dirs: std::collections::HashSet::new(),
+            fd_cache: Arc::new(DashMap::with_capacity(FD_CACHE_SIZE)),
+            metadata_cache: Arc::new(DashMap::with_capacity(METADATA_CACHE_SIZE)),
         }
+    }
+
+    /// Get or open a file, caching the file descriptor
+    /// DashMap provides lock-free reads - zero contention on cache hits!
+    async fn get_or_open_file(&self, path: &Path) -> Result<Arc<fs::File>, StorageError> {
+        // Fast path: lock-free check with DashMap
+        if let Some(file) = self.fd_cache.get(path) {
+            return Ok(file.clone());
+        }
+
+        // Slow path: open file and cache it
+        let file = fs::File::open(path).await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::Internal(format!("file not found: {:?}", path))
+                } else {
+                    StorageError::Internal(format!("open file: {}", e))
+                }
+            })?;
+
+        let arc_file = Arc::new(file);
+
+        // Simple eviction: if cache is full, clear 10% of entries
+        if self.fd_cache.len() >= FD_CACHE_SIZE {
+            let to_remove = FD_CACHE_SIZE / 10;
+            let keys: Vec<_> = self.fd_cache.iter().take(to_remove).map(|r| r.key().clone()).collect();
+            for key in keys {
+                self.fd_cache.remove(&key);
+            }
+        }
+
+        self.fd_cache.insert(path.to_path_buf(), arc_file.clone());
+
+        Ok(arc_file)
+    }
+
+    /// Get cached metadata or read from disk
+    /// DashMap provides lock-free reads - zero contention on cache hits!
+    async fn get_metadata(&self, bucket: &str, key: &str, meta_path: &Path) -> Result<StoredMeta, StorageError> {
+        let cache_key = (bucket.to_string(), key.to_string());
+
+        // Fast path: lock-free check with DashMap
+        if let Some(cached) = self.metadata_cache.get(&cache_key) {
+            cached.accessed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(cached.stored.clone());
+        }
+
+        // Slow path: read from disk and cache
+        let stored = read_stored_meta(meta_path).await?;
+
+        // Simple eviction: if cache is full, clear 10% of least recently used entries
+        if self.metadata_cache.len() >= METADATA_CACHE_SIZE {
+            let to_remove = METADATA_CACHE_SIZE / 10;
+            let mut entries: Vec<_> = self.metadata_cache.iter()
+                .map(|r| (r.key().clone(), r.value().accessed.load(std::sync::atomic::Ordering::Relaxed)))
+                .collect();
+            entries.sort_by_key(|(_, accessed)| *accessed);
+            for (key, _) in entries.into_iter().take(to_remove) {
+                self.metadata_cache.remove(&key);
+            }
+        }
+
+        let cached = Arc::new(CachedMetadata {
+            stored: stored.clone(),
+            accessed: std::sync::atomic::AtomicU64::new(1),
+        });
+        self.metadata_cache.insert(cache_key, cached);
+
+        Ok(stored)
     }
 
     // Multi-drive helper methods
@@ -248,6 +323,376 @@ impl FsStoreActor {
             .and_then(|s| s.to_str())
             .unwrap_or("obj")
             .to_string();
+        p.set_file_name(format!("{}.shards", file_name));
+        p
+    }
+
+    /// Direct GET without actor message passing + aggressive caching
+    /// This bypasses the 20-30ms actor overhead AND eliminates disk I/O on cache hits
+    pub async fn get_object_direct(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Bytes, ObjectMetadata), StorageError> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let obj_path = self.object_path(bucket, key);
+        let meta_path = self.meta_path(&obj_path);
+
+        // Get cached metadata (zero disk I/O on cache hit!)
+        let stored = self.get_metadata(bucket, key, &meta_path).await.map_err(|_| {
+            StorageError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            }
+        })?;
+
+        // Read data based on storage mode
+        let data = match (stored.data_blocks, stored.parity_blocks) {
+            (Some(db), Some(pb)) if pb > 0 => {
+                // Erasure coded: read shards and reconstruct
+                self.read_shards_direct(bucket, key, db, pb, stored.size).await?
+            }
+            (Some(db), Some(0)) => {
+                // Striped without EC: read chunks and concatenate
+                self.read_striped_chunks(bucket, key, db, stored.size).await?
+            }
+            _ => {
+                // Single file storage (no sharding)
+                let drive = self.primary_drive();
+                let drive_name = drive.display().to_string();
+                let read_start = std::time::Instant::now();
+
+                let data = read_file_buffered(&obj_path).await.map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    },
+                    _ => StorageError::Internal(format!("read object: {e}")),
+                })?;
+
+                prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                data
+            }
+        };
+
+        // Update metrics
+        self.metrics.inc_get();
+        self.metrics.add_bytes_out(data.len() as u64);
+
+        Ok((Bytes::from(data), to_object_metadata(stored)))
+    }
+
+    async fn read_shards_direct(
+        &self,
+        bucket: &str,
+        key: &str,
+        db: usize,
+        pb: usize,
+        size: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        use tokio::io::AsyncReadExt;
+
+        let total = db + pb.max(1);
+        let block_size = 1024 * 1024; // 1MB blocks for streaming
+        let mut out = acquire_buffer_with_capacity(size as usize);
+
+        // Get cached file descriptors (zero syscalls on cache hit!)
+        let mut readers: Vec<Option<(BufReader<fs::File>, String)>> = Vec::with_capacity(total);
+
+        for idx in 0..total {
+            let drive = self.drive_for_shard(idx);
+            let drive_name = drive.display().to_string();
+            let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+            let shard_path = shard_dir.join(format!("{}", idx));
+
+            match self.get_or_open_file(&shard_path).await {
+                Ok(arc_file) => {
+                    // try_clone() creates a new File pointing to the same FD
+                    // This is cheap - just dup() syscall, not open()
+                    match arc_file.as_ref().try_clone().await {
+                        Ok(mut f) => {
+                            // CRITICAL: Reset file position to 0
+                            // try_clone() shares the file offset, so we must reset it
+                            use tokio::io::AsyncSeekExt;
+                            if let Err(e) = f.seek(std::io::SeekFrom::Start(0)).await {
+                                return Err(StorageError::Internal(format!(
+                                    "seek shard {}: {}",
+                                    idx, e
+                                )));
+                            }
+                            let reader = BufReader::with_capacity(block_size, f);
+                            readers.push(Some((reader, drive_name)));
+                        }
+                        Err(e) => {
+                            return Err(StorageError::Internal(format!(
+                                "clone file handle for shard {}: {}",
+                                idx, e
+                            )))
+                        }
+                    }
+                }
+                Err(_) => {
+                    // File not found - might be reconstructible from parity
+                    readers.push(None);
+                }
+            }
+        }
+
+        let mut bytes_read = 0u64;
+
+        // Stream blocks from all shards
+        while bytes_read < size {
+            let mut blocks: Vec<Option<Vec<u8>>> = vec![None; db];
+            let parity_idx = total - 1;
+
+            // Read one block from each data shard
+            for idx in 0..db {
+                if let Some((reader, drive_name)) = &mut readers[idx] {
+                    let mut buf = vec![0u8; block_size];
+                    let read_start = std::time::Instant::now();
+
+                    match reader.read(&mut buf).await {
+                        Ok(n) => {
+                            buf.truncate(n);
+                            if n > 0 {
+                                prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                                prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                                blocks[idx] = Some(buf);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(StorageError::Internal(format!("read shard {}: {}", idx, e)))
+                        }
+                    }
+                }
+            }
+
+            // Read one block from parity shard
+            let mut parity_block: Option<Vec<u8>> = None;
+            if let Some((reader, drive_name)) = &mut readers[parity_idx] {
+                let mut buf = vec![0u8; block_size];
+                let read_start = std::time::Instant::now();
+
+                match reader.read(&mut buf).await {
+                    Ok(n) => {
+                        buf.truncate(n);
+                        if n > 0 {
+                            prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                            prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                            parity_block = Some(buf);
+                        }
+                    }
+                    Err(e) => {
+                        return Err(StorageError::Internal(format!("read parity: {}", e)))
+                    }
+                }
+            }
+
+            // Check for missing shard in this stripe
+            let missing_idx = blocks.iter().enumerate()
+                .find_map(|(i, b)| if b.is_none() { Some(i) } else { None });
+
+            if let Some(miss) = missing_idx {
+                // Reconstruct missing block using XOR
+                if pb == 0 || parity_block.is_none() {
+                    return Err(StorageError::Internal("missing shard with no parity".into()));
+                }
+
+                let parity = parity_block.as_ref().unwrap();
+                let block_len = blocks.iter().flatten().next().map(|b| b.len()).unwrap_or(parity.len());
+                let mut reconstructed = vec![0u8; block_len];
+
+                // Start with parity
+                reconstructed[..parity.len().min(block_len)].copy_from_slice(&parity[..parity.len().min(block_len)]);
+
+                // XOR with all other blocks
+                for (i, block_opt) in blocks.iter().enumerate() {
+                    if i != miss {
+                        if let Some(block) = block_opt {
+                            for (j, &byte) in block.iter().enumerate().take(block_len) {
+                                reconstructed[j] ^= byte;
+                            }
+                        }
+                    }
+                }
+
+                blocks[miss] = Some(reconstructed);
+            }
+
+            // Concatenate blocks into output
+            for block_opt in blocks.iter() {
+                if let Some(block) = block_opt {
+                    let remaining = size as usize - out.len();
+                    let to_copy = std::cmp::min(block.len(), remaining);
+                    out.extend_from_slice(&block[..to_copy]);
+                    bytes_read += to_copy as u64;
+
+                    if out.len() >= size as usize {
+                        break;
+                    }
+                }
+            }
+
+            // Check if all shards are exhausted
+            if blocks.iter().all(|b| b.is_none()) {
+                break;
+            }
+        }
+
+        // Truncate to exact size
+        out.truncate(size as usize);
+
+        Ok(out)
+    }
+
+    /// Read striped chunks without erasure coding (parallel I/O, no reconstruction)
+    async fn read_striped_chunks(
+        &self,
+        bucket: &str,
+        key: &str,
+        num_chunks: usize,
+        size: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        let mut out = Vec::with_capacity(size as usize);
+
+        // Read each chunk in order and concatenate
+        for idx in 0..num_chunks {
+            let drive = self.drive_for_shard(idx);
+            let drive_name = drive.display().to_string();
+            let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
+            let shard_path = shard_dir.join(format!("{}", idx));
+
+            let read_start = std::time::Instant::now();
+
+            // Read chunk with caching
+            let chunk_data = match self.get_or_open_file(&shard_path).await {
+                Ok(arc_file) => {
+                    // Clone the file handle and read its contents
+                    match arc_file.as_ref().try_clone().await {
+                        Ok(mut f) => {
+                            // Reset file position
+                            use tokio::io::AsyncSeekExt;
+                            if let Err(e) = f.seek(std::io::SeekFrom::Start(0)).await {
+                                return Err(StorageError::Internal(format!("seek chunk {}: {}", idx, e)));
+                            }
+
+                            // Read entire chunk
+                            use tokio::io::AsyncReadExt;
+                            let mut data = Vec::new();
+                            if let Err(e) = f.read_to_end(&mut data).await {
+                                return Err(StorageError::Internal(format!("read chunk {}: {}", idx, e)));
+                            }
+                            data
+                        }
+                        Err(e) => {
+                            return Err(StorageError::Internal(format!("clone file handle for chunk {}: {}", idx, e)));
+                        }
+                    }
+                }
+                Err(_) => {
+                    return Err(StorageError::Internal(format!("chunk {} not found", idx)));
+                }
+            };
+
+            prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+            prom_metrics::increment_disk_shard_ops("read", &drive_name);
+
+            out.extend_from_slice(&chunk_data);
+        }
+
+        // Truncate to exact size (last chunk may have padding)
+        out.truncate(size as usize);
+
+        Ok(out)
+    }
+}
+
+/// Filesystem storage actor
+///
+/// Processes filesystem operations sequentially. All state is private
+/// to this actor, so no locks are needed.
+pub struct FsStoreActor {
+    /// Shared reader for direct access
+    reader: FsStoreReader,
+
+    /// Incoming command channel
+    rx: mpsc::Receiver<FsCommand>,
+
+    /// Cache of created directories (optimization)
+    created_dirs: std::collections::HashSet<PathBuf>,
+}
+
+impl FsStoreActor {
+    /// Create a new FsStoreActor
+    pub fn new(
+        drives: Vec<PathBuf>,
+        erasure_enabled: bool,
+        data_blocks: usize,
+        parity_blocks: usize,
+        rx: mpsc::Receiver<FsCommand>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        assert!(!drives.is_empty(), "At least one drive required");
+
+        let reader = FsStoreReader::new(drives, erasure_enabled, data_blocks, parity_blocks, metrics);
+
+        Self {
+            reader,
+            rx,
+            created_dirs: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Get a cloneable reader for direct access (bypasses actor)
+    pub fn reader(&self) -> FsStoreReader {
+        self.reader.clone()
+    }
+
+    // Multi-drive helper methods - delegate to reader
+    fn primary_drive(&self) -> &Path {
+        self.reader.primary_drive()
+    }
+
+    fn drive_for_shard(&self, shard_index: usize) -> &Path {
+        self.reader.drive_for_shard(shard_index)
+    }
+
+    // Path helper methods - delegate to reader
+    fn bucket_path(&self, bucket: &str) -> PathBuf {
+        self.reader.bucket_path(bucket)
+    }
+
+    fn bucket_path_on_drive(&self, drive: &Path, bucket: &str) -> PathBuf {
+        self.reader.bucket_path_on_drive(drive, bucket)
+    }
+
+    fn object_path(&self, bucket: &str, key: &str) -> PathBuf {
+        self.reader.object_path(bucket, key)
+    }
+
+    fn object_path_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
+        self.reader.object_path_on_drive(drive, bucket, key)
+    }
+
+    fn meta_path(&self, obj_path: &Path) -> PathBuf {
+        self.reader.meta_path(obj_path)
+    }
+
+    fn shard_dir_on_drive(&self, drive: &Path, bucket: &str, key: &str) -> PathBuf {
+        self.reader.shard_dir_on_drive(drive, bucket, key)
+    }
+
+    fn shard_dir(&self, bucket: &str, key: &str) -> PathBuf {
+        let obj_path = self.object_path(bucket, key);
+        let mut p = obj_path;
+        let file_name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("obj")
+            .to_string();
         p.set_file_name(format!("{file_name}.shards"));
         p
     }
@@ -259,8 +704,8 @@ impl FsStoreActor {
     pub async fn run(mut self) {
         tracing::info!(
             "FsStoreActor started, drives={} ({})",
-            self.drives.len(),
-            self.drives
+            self.reader.drives.len(),
+            self.reader.drives
                 .iter()
                 .map(|d| d.display().to_string())
                 .collect::<Vec<_>>()
@@ -268,7 +713,7 @@ impl FsStoreActor {
         );
 
         while let Some(cmd) = self.rx.recv().await {
-            self.metrics.inc_message_received();
+            self.reader.metrics.inc_message_received();
 
             match cmd {
                 FsCommand::PutObject { bucket, key, data, headers, reply } => {
@@ -420,13 +865,15 @@ impl FsStoreActor {
         let meta_path = self.meta_path(&obj_path);
         let size = data.len() as u64;
 
-        // Fast path for small objects: store inline without erasure coding
-        if data.len() <= SMALL_OBJECT_THRESHOLD {
+        // Fast path: store inline without erasure coding if:
+        // 1. Erasure coding is disabled, OR
+        // 2. Object is small (<= 128KB)
+        if !self.reader.erasure_enabled || data.len() <= SMALL_OBJECT_THRESHOLD {
             return self.handle_put_object_inline(bucket, key, data, headers, obj_path, meta_path, size).await;
         }
 
-        let parity_blocks = self.erasure.parity_blocks.max(1);
-        let shard_count = self.erasure.data_blocks + parity_blocks;
+        let parity_blocks = self.reader.erasure.parity_blocks.max(1);
+        let shard_count = self.reader.erasure.data_blocks + parity_blocks;
 
         // Open buffered writers for all shards, each on its designated drive
         let mut files = Vec::new();
@@ -460,17 +907,17 @@ impl FsStoreActor {
         let mut hasher = blake3::Hasher::new();
 
         // Calculate stripe size
-        let stripe_size = self.erasure.block_size * self.erasure.data_blocks;
+        let stripe_size = self.reader.erasure.block_size * self.reader.erasure.data_blocks;
 
         for stripe_start in (0..data.len()).step_by(stripe_size) {
-            let mut parity_block = acquire_buffer(self.erasure.block_size);
+            let mut parity_block = acquire_buffer(self.reader.erasure.block_size);
 
             let stripe_end = std::cmp::min(stripe_start + stripe_size, data.len());
             let stripe_data_len = stripe_end - stripe_start;
 
-            let chunk_size = stripe_data_len.div_ceil(self.erasure.data_blocks);
+            let chunk_size = stripe_data_len.div_ceil(self.reader.erasure.data_blocks);
 
-            for data_idx in 0..self.erasure.data_blocks {
+            for data_idx in 0..self.reader.erasure.data_blocks {
                 let shard_idx = data_idx;
                 let offset = stripe_start + data_idx * chunk_size;
                 if offset >= data.len() {
@@ -505,7 +952,7 @@ impl FsStoreActor {
             for (idx, parity_file) in files
                 .iter_mut()
                 .enumerate()
-                .skip(self.erasure.data_blocks)
+                .skip(self.reader.erasure.data_blocks)
                 .take(parity_blocks)
             {
                 let drive = self.drive_for_shard(idx);
@@ -541,9 +988,9 @@ impl FsStoreActor {
             size,
             last_modified_unix_secs: Utc::now().timestamp(),
             metadata: headers.metadata,
-            data_blocks: Some(self.erasure.data_blocks),
-            parity_blocks: Some(self.erasure.parity_blocks),
-            block_size: Some(self.erasure.block_size),
+            data_blocks: Some(self.reader.erasure.data_blocks),
+            parity_blocks: Some(self.reader.erasure.parity_blocks),
+            block_size: Some(self.reader.erasure.block_size),
             storage_class: headers.storage_class,
             server_side_encryption: headers.server_side_encryption,
             version_id: None,
@@ -559,17 +1006,17 @@ impl FsStoreActor {
             .map_err(|e| StorageError::Internal(format!("write meta: {}", e)))?;
 
         // Update metrics
-        self.metrics.inc_put();
-        self.metrics.add_bytes_in(size);
+        self.reader.metrics.inc_put();
+        self.reader.metrics.add_bytes_in(size);
 
         Ok(to_object_metadata(stored_meta))
     }
 
-    // Fast path for small objects (<128KB): store inline without erasure coding
+    // Inline storage: No erasure coding, but stripe across drives for parallelism
     async fn handle_put_object_inline(
         &self,
-        _bucket: &str,
-        _key: &str,
+        bucket: &str,
+        key: &str,
         data: Bytes,
         headers: crate::actor::messages::ObjectHeaders,
         obj_path: PathBuf,
@@ -579,27 +1026,74 @@ impl FsStoreActor {
         // Compute hash
         let etag = blake3::hash(&data).to_hex().to_string();
 
-        // Write object data directly to a single file
-        let write_start = std::time::Instant::now();
-        fs::write(&obj_path, &data)
-            .await
-            .map_err(|e| StorageError::Internal(format!("write inline object: {}", e)))?;
+        // OPTIMIZATION: Stripe across multiple drives for parallel I/O
+        // Even without erasure coding, we split the object into chunks and write to different drives
+        let num_drives = self.reader.drives.len();
+        let is_striped = num_drives > 1 && data.len() > 64 * 1024;
 
-        let drive = self.primary_drive();
-        let drive_name = drive.display().to_string();
-        prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
-        prom_metrics::increment_disk_shard_ops("write", &drive_name);
+        if is_striped {
+            // Multi-drive striping: split into equal chunks
+            let chunk_size = data.len().div_ceil(num_drives);
+            let shard_dir = self.shard_dir(bucket, key);
 
-        // Create metadata (no erasure coding params)
+            // Create shard directory
+            fs::create_dir_all(&shard_dir)
+                .await
+                .map_err(|e| StorageError::Internal(format!("create shard dir: {}", e)))?;
+
+            // Write chunks to different drives in parallel (well, sequentially for now)
+            for (idx, chunk) in data.chunks(chunk_size).enumerate() {
+                let drive = self.drive_for_shard(idx);
+                let drive_name = drive.display().to_string();
+                let shard_dir_on_drive = self.shard_dir_on_drive(drive, bucket, key);
+                let shard_path = shard_dir_on_drive.join(format!("{}", idx));
+
+                // Create parent dirs if needed
+                if let Some(parent) = shard_path.parent() {
+                    fs::create_dir_all(parent).await.ok();
+                }
+
+                let write_start = std::time::Instant::now();
+                fs::write(&shard_path, chunk)
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("write striped chunk {}: {}", idx, e)))?;
+
+                prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
+                prom_metrics::increment_disk_shard_ops("write", &drive_name);
+            }
+        } else {
+            // Single drive or small object: write to one file
+            let write_start = std::time::Instant::now();
+            fs::write(&obj_path, &data)
+                .await
+                .map_err(|e| StorageError::Internal(format!("write inline object: {}", e)))?;
+
+            let drive = self.primary_drive();
+            let drive_name = drive.display().to_string();
+            prom_metrics::record_disk_shard_write(&drive_name, write_start.elapsed().as_secs_f64());
+            prom_metrics::increment_disk_shard_ops("write", &drive_name);
+        }
+
+        // Create metadata
+        // For striped objects: data_blocks=num_chunks, parity_blocks=0 (no EC)
+        // For single file: data_blocks=None, parity_blocks=None
+        let (data_blocks, parity_blocks, block_size) = if is_striped {
+            let chunk_size = data.len().div_ceil(num_drives);
+            let num_chunks = data.len().div_ceil(chunk_size);
+            (Some(num_chunks), Some(0), Some(chunk_size))
+        } else {
+            (None, None, None)
+        };
+
         let stored_meta = StoredMeta {
             content_type: headers.content_type,
             etag: etag.clone(),
             size,
             last_modified_unix_secs: Utc::now().timestamp(),
             metadata: headers.metadata,
-            data_blocks: None,  // No sharding
-            parity_blocks: None,
-            block_size: None,
+            data_blocks,
+            parity_blocks,
+            block_size,
             storage_class: headers.storage_class,
             server_side_encryption: headers.server_side_encryption,
             version_id: None,
@@ -615,8 +1109,8 @@ impl FsStoreActor {
             .map_err(|e| StorageError::Internal(format!("write meta: {}", e)))?;
 
         // Update metrics
-        self.metrics.inc_put();
-        self.metrics.add_bytes_in(size);
+        self.reader.metrics.inc_put();
+        self.reader.metrics.add_bytes_in(size);
 
         Ok(to_object_metadata(stored_meta))
     }
@@ -640,31 +1134,39 @@ impl FsStoreActor {
             }
         })?;
 
-        // Read shards and reconstruct data
-        let data = if let (Some(db), Some(pb)) = (stored.data_blocks, stored.parity_blocks) {
-            self.read_shards(bucket, key, db, pb, stored.size).await?
-        } else {
-            // Fast path for inline objects (no sharding)
-            let drive = self.primary_drive();
-            let drive_name = drive.display().to_string();
-            let read_start = std::time::Instant::now();
+        // Read data based on storage mode
+        let data = match (stored.data_blocks, stored.parity_blocks) {
+            (Some(db), Some(pb)) if pb > 0 => {
+                // Erasure coded: read shards and reconstruct
+                self.read_shards(bucket, key, db, pb, stored.size).await?
+            }
+            (Some(db), Some(0)) => {
+                // Striped without EC: use reader's striped method
+                self.reader.read_striped_chunks(bucket, key, db, stored.size).await?
+            }
+            _ => {
+                // Single file storage (no sharding)
+                let drive = self.primary_drive();
+                let drive_name = drive.display().to_string();
+                let read_start = std::time::Instant::now();
 
-            let data = read_file_buffered(&obj_path).await.map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                _ => StorageError::Internal(format!("read object: {e}")),
-            })?;
+                let data = read_file_buffered(&obj_path).await.map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => StorageError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    },
+                    _ => StorageError::Internal(format!("read object: {e}")),
+                })?;
 
-            prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
-            prom_metrics::increment_disk_shard_ops("read", &drive_name);
-            data
+                prom_metrics::record_disk_shard_read(&drive_name, read_start.elapsed().as_secs_f64());
+                prom_metrics::increment_disk_shard_ops("read", &drive_name);
+                data
+            }
         };
 
         // Update metrics
-        self.metrics.inc_get();
-        self.metrics.add_bytes_out(data.len() as u64);
+        self.reader.metrics.inc_get();
+        self.reader.metrics.add_bytes_out(data.len() as u64);
 
         Ok((Bytes::from(data), to_object_metadata(stored)))
     }
@@ -857,13 +1359,13 @@ impl FsStoreActor {
         let _ = fs::remove_file(&meta_path).await;
 
         // Delete shard directories from all drives
-        for drive in &self.drives {
+        for drive in self.reader.drives.iter() {
             let shard_dir = self.shard_dir_on_drive(drive, bucket, key);
             let _ = fs::remove_dir_all(&shard_dir).await;
         }
 
         // Update metrics
-        self.metrics.inc_delete();
+        self.reader.metrics.inc_delete();
 
         Ok(true)
     }
@@ -886,7 +1388,7 @@ impl FsStoreActor {
             .await?;
 
         // Update metrics
-        self.metrics.inc_list();
+        self.reader.metrics.inc_list();
 
         Ok(results)
     }

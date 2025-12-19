@@ -25,6 +25,6 @@ pub mod messages;
 pub mod metrics;
 
 pub use backend::ActorStorageBackend;
-pub use fs_store::FsStoreActor;
+pub use fs_store::{FsStoreActor, FsStoreReader};
 pub use messages::{FsCommand, ObjectHeaders};
 pub use metrics::Metrics;

@@ -18,7 +18,7 @@ use crate::storage::StorageError;
 
 /// Very small XOR-based erasure helper that simulates data+parity shards.
 /// Supports reconstruction of a single missing shard when parity is present.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Erasure {
     pub data_blocks: usize,
     pub parity_blocks: usize,
